@@ -11,6 +11,48 @@ import webui
 
 
 class ColourTests(unittest.TestCase):
+    def test_wide_colour_patches_of_multiple_sizes(self):
+        y, x = np.mgrid[:128, :160]
+        for radius in (5, 12, 22):
+            with self.subTest(radius=radius):
+                patch = (0.085 * np.exp(-((x - 80) ** 2 + (y - 64) ** 2) /
+                                       (2 * radius ** 2))).astype(np.float32)
+                luma = (0.4 + 0.015 * np.sin(x * 1.5)).astype(np.float32)
+                image = np.repeat(luma[..., None], 3, axis=2)
+                image[..., 0] += patch
+                image[..., 1] -= patch * color.LUMA[0] / color.LUMA[1]
+                result = color.clean_chroma(image, 1)
+                np.testing.assert_allclose(result @ color.LUMA, image @ color.LUMA, atol=1e-6)
+                self.assertLess(result[64, 80, 0] - luma[64, 80], patch[64, 80] * 0.7)
+                # A constant coloured material is not automatically desaturated.
+                uniform = np.broadcast_to(image[64, 80], image.shape).copy()
+                np.testing.assert_allclose(color.clean_chroma(uniform, 1), uniform, atol=1e-6)
+
+    def test_bands_under_fine_texture(self):
+        y, x = np.mgrid[:96, :256]
+        ramp = (0.25 + 0.3 * x / 255).astype(np.float32)
+        detail = (0.009 * np.cos(x * np.pi) * np.cos(y * np.pi)).astype(np.float32)
+        banded = np.round(ramp * 32) / 32
+        image = np.repeat((banded + detail)[..., None], 3, axis=2)
+        result, mask = color.clean_gradients(image, 1)
+        target = ramp + detail
+        region = np.s_[16:-16, 40:-40]
+        before = np.mean((image[..., 0][region] - target[region]) ** 2)
+        after = np.mean((result[..., 0][region] - target[region]) ** 2)
+        self.assertLess(after, before * 0.8)
+        # The checker component should not be globally blurred away.
+        original_detail = np.mean((image[1:-1, 40:-40, 0] - image[2:, 40:-40, 0]) ** 2)
+        retained_detail = np.mean((result[1:-1, 40:-40, 0] - result[2:, 40:-40, 0]) ** 2)
+        self.assertGreater(retained_detail, original_detail * 0.85)
+
+    def test_box_max_matches_full_window(self):
+        field = np.random.default_rng(7).random((5, 9), dtype=np.float32)
+        for radius in (1, 2, 4, 8):
+            padded = np.pad(field, radius, mode="edge")
+            expected = np.array([[padded[y:y + 2*radius + 1, x:x + 2*radius + 1].max()
+                                  for x in range(9)] for y in range(5)])
+            np.testing.assert_array_equal(color._box_max(field, radius), expected)
+
     def test_chroma_noise_reduced_without_luma_change(self):
         rng = np.random.default_rng(42)
         y, x = np.mgrid[:64, :80]

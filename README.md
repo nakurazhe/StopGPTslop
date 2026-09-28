@@ -97,14 +97,19 @@ The batch CLI is unchanged. Validate the tradeoff on 1:1 crops of your own image
 Two independent CPU controls are **off by default (0)**, preserving the previous
 output. Start at **0.50** on an affected image and inspect at 1:1 with grain at zero.
 
-- **Colour blotches**: full-resolution, colour/brightness-aware neighbourhood
-  smoothing of opponent colour channels, retaining luma. Small false-colour spots
-  can be reduced; broad wrong lighting, strong fringes and colour moire may remain.
-  Real low-contrast colour detail can also be affected.
-- **Gradient banding**: bounded multiscale smoothing of quiet, low-contrast areas,
-  with RGB edge/texture and full-window variance protection. It targets tonal
-  steps, not jagged diagonal object edges. Strong bands can remain; weak genuine
-  contours may soften at high strength.
+- **Colour blotches**: full-resolution colour/brightness-aware smoothing plus
+  a quarter-resolution guide for patches at approximately 8–32 px radii. Opposite
+  neighbours must agree before correcting a local colour/saturation outlier;
+  luma is retained. Strength controls both correction and the accepted colour
+  difference. Uniform coloured materials and strong colour boundaries are
+  protected, but genuine isolated colour accents can still resemble blotches.
+  Broad wrong lighting, strong fringes and colour moire may remain.
+- **Gradient banding**: multiscale correction of a low-frequency guide up to a
+  32 px radius, retaining the original high-frequency residual. Strength adapts
+  the contrast/texture thresholds, allowing stronger steps and modest texture.
+  RGB variance and full-window edge maxima protect contours and thin lines.
+  It targets tonal steps, not jagged diagonal object edges. Strong bands can
+  remain; weak genuine contours may soften at high strength.
 - **Gradient dithering**: enabled by default, but active only with debanding and
   only where it changes pixels. Adds stable monochrome noise of at most half an
   8-bit code step before rounding, separately from artistic grain.

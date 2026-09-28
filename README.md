@@ -92,31 +92,6 @@ the same residual texture again. Grain remains a separate, intentional effect;
 keep it at zero when evaluating fine-artifact removal.
 The batch CLI is unchanged. Validate the tradeoff on 1:1 crops of your own images.
 
-### Thin-line protection (experimental Web UI control)
-
-**Off by default (0)**, leaving the previous result unchanged. Start at **0.50**
-if processing smears fine lines. This is independent of Preserve micro-texture:
-it compares the source with the finished image after cleanup, SR and sharpening,
-before grain/dither. Two source-scale luminance bands are partially restored only
-where line/ridge structure survives, remains correlated and has lost contrast.
-Loss is evaluated across both scales together: stronger pixel edges after
-sharpening cannot hide a softened line body. In confirmed damaged regions,
-the source band shape is blended back, including reducing exaggerated edges,
-instead of merely adding a small contrast boost. Undamaged/amplified structure
-alone does not trigger restoration; higher strength may undo more stylization.
-It does not recognize objects, colours or "nature", nor protect an entire region
-merely because it has dense texture. Monotonic steps, flat areas, isolated dots
-and pixel checkerboards are rejected by the guide. Chroma and the broad source
-image are not blended back; at 2x, analysis stays at source resolution.
-
-This is not a semantic guarantee: line-like artifacts can also be retained, and
-fully destroyed/replaced detail is deliberately not reconstructed. Check faces,
-fabric, text and other objects at 1:1 as well as the problem area. Zero restores
-the old pipeline exactly for identical other settings. The orange cleanup mask
-does not display this protection. Changing its strength reuses the VAE/SR cache.
-The guide is cached; CPU time and RAM increase, with no extra GPU inference,
-weights or dependencies. The CLI and other defaults remain unchanged.
-
 ### Colour and gradients (experimental Web UI finishing)
 
 Two independent CPU controls are **off by default (0)**, preserving the previous

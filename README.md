@@ -68,6 +68,25 @@ the result alone or a side-by-side comparison.
 The interface follows your system language (English / 简体中文) and colour theme, and
 both can be switched from the header.
 
+### Selective fine cleanup (experimental Web UI mode)
+
+Enabled by default, this CPU-only finishing stage targets repeated fine patterns
+and isolated tiny spots. It uses local masks to protect broad edges and directional
+detail. It is heuristic: fabric, pores and other real textures may still be affected.
+
+- **Micro-texture suppression** (default 0.55): attenuates short repeating patterns.
+- **Tiny spots** (0.35): selectively reduces isolated bright/dark pixel outliers.
+- **Preserve micro-texture** (0.65): higher keeps more of the original fine texture;
+  lower returns less texture bypassed by the VAE, only in masked areas.
+- **Show mask**: orange marks candidate processing areas. Downloaded PNGs remain
+  clean; comparison export is disabled while the mask is displayed.
+
+Disable **Selective fine cleanup** for the previous processing mode with the same
+main strength and micro-texture setting. The new stage runs before optional SR.
+Decoded images are cached so changing CPU cleanup controls with SR off does not
+repeat GPU inference. No additional model weights or packages are required.
+The batch CLI is unchanged. Validate the tradeoff on 1:1 crops of your own images.
+
 ## Command line
 
 ```bash

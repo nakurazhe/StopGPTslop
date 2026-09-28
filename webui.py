@@ -41,6 +41,7 @@ sys.path.insert(0, HERE)
 # Model definitions live in modeling.py so there is only one copy of them
 from modeling import (ALIGN, build_fns, load_vae, load_refiner_model,
                       load_realesrgan_model)  # noqa: E402
+import fine_cleanup
 
 STATE = {}
 CACHE = {}
@@ -379,8 +380,15 @@ input[type=range]:active::-webkit-slider-thumb{transform:scale(1.14)}
 
       <div class="grp">
         <span class="eyebrow" data-i="secMicro"></span>
+        <label class="hint"><span data-i="fineEnabled"></span><input id="fineEnabled" type="checkbox" checked></label>
         <label class="hint"><span data-i="microLabel"></span> <b class="num" id="microVal">0.55</b></label>
         <input type="range" id="micro" min="0" max="1" step="0.05" value="0.55">
+        <label class="hint"><span data-i="spotsLabel"></span> <b class="num" id="spotsVal">0.35</b></label>
+        <input type="range" id="spots" min="0" max="1" step="0.05" value="0.35">
+        <label class="hint"><span data-i="preserveLabel"></span> <b class="num" id="preserveVal">0.65</b></label>
+        <input type="range" id="preserve" min="0" max="1" step="0.05" value="0.65">
+        <label class="hint"><span data-i="maskLabel"></span><input id="showMask" type="checkbox"></label>
+        <p class="sm" data-i="fineHint"></p>
       </div>
 
       <div class="grp">
@@ -487,6 +495,21 @@ Object.assign(I18N.zh,{
   secUpscale:"Real-ESRGAN",srOff:"\u5173",sr1x:"\u6062\u590d 1\u00d7",sr2x:"\u653e\u5927 2\u00d7",srBlendLabel:"AI \u6743\u91cd"
 });
 const PRESETS=[[0.25,"p25"],[0.5,"p50"],[0.75,"p75"],[1.0,"p100"]];
+Object.assign(I18N.ru,{
+  fineEnabled:"Комплексная очистка", spotsLabel:"Мелкие точки",
+  preserveLabel:"Сохранение микротекстуры", maskLabel:"Показать маску",
+  fineHint:"Оранжевым отмечены зоны воздействия. Выключите комплексную очистку для прежнего режима. PNG сохраняется без маски."
+});
+Object.assign(I18N.en,{
+  fineEnabled:"Selective fine cleanup", spotsLabel:"Tiny spots",
+  preserveLabel:"Preserve micro-texture", maskLabel:"Show mask",
+  fineHint:"Orange shows affected areas. Disable selective cleanup for the previous mode. PNG saves without the mask."
+});
+Object.assign(I18N.zh,{
+  fineEnabled:"选择性细节清理", spotsLabel:"细小斑点",
+  preserveLabel:"保留微纹理", maskLabel:"显示蒙版",
+  fineHint:"橙色表示处理区域。关闭后使用旧模式。PNG 不包含蒙版。"
+});
 
 const navLang=(navigator.language||"en").toLowerCase();
 let lang=navLang.startsWith("zh")?"zh":navLang.startsWith("ru")?"ru":"en";
@@ -522,7 +545,8 @@ const drop=$("#drop"),file=$("#file"),slider=$("#a"),aval=$("#aval"),wrap=$("#wr
       cmp=$("#cmp"),before=$("#before"),afterimg=$("#afterimg"),after=$("#after"),bar=$("#bar"),
       busy=$("#busy"),err=$("#err"),status=$("#status"),emptyMsg=$("#emptyMsg"),
       thumb=$("#thumb"),dl=$("#dl"),dlcmp=$("#dlcmp"),
-      micro=$("#micro"),detail=$("#detail"),cas=$("#cas"),grain=$("#grain"),srBlend=$("#srBlend");
+      micro=$("#micro"),detail=$("#detail"),cas=$("#cas"),grain=$("#grain"),srBlend=$("#srBlend"),
+      spots=$("#spots"),preserve=$("#preserve"),fineEnabled=$("#fineEnabled"),showMask=$("#showMask");
 let srcData=null,key=null,outData=null,fname="",seq=0,pending=false,fit=true,dispScale=1,
     lastMs=null,lastCached=false,outW=null,outH=null,srMode="off",rerun=false;
 
@@ -686,10 +710,13 @@ function onRestore(){
   morphValue($("#casVal"),(+cas.value).toFixed(2));
   morphValue($("#grainVal"),(+grain.value).toFixed(3));
   morphValue($("#srBlendVal"),(+srBlend.value).toFixed(2));
-  [micro,detail,cas,grain,srBlend].forEach(rangeFill);
+  morphValue($("#spotsVal"),(+spots.value).toFixed(2));
+  morphValue($("#preserveVal"),(+preserve.value).toFixed(2));
+  [micro,detail,cas,grain,srBlend,spots,preserve].forEach(rangeFill);
+  spots.disabled=preserve.disabled=showMask.disabled=!fineEnabled.checked;
   clearTimeout(detail._t);detail._t=setTimeout(run,240);
 }
-[micro,detail,cas,grain,srBlend].forEach(x=>x.oninput=onRestore);
+[micro,detail,cas,grain,srBlend,spots,preserve,fineEnabled,showMask].forEach(x=>x.oninput=onRestore);
 
 async function run(){
   if(!srcData)return;
@@ -700,12 +727,14 @@ async function run(){
       headers:{"Content-Type":"application/json"},
       body:JSON.stringify({image:srcData,alpha:+slider.value,key,
                            micro:+micro.value,detail:+detail.value,cas:+cas.value,grain:+grain.value,
+                           fine_enabled:fineEnabled.checked,spots:+spots.value,preserve:+preserve.value,
+                           show_mask:showMask.checked&&fineEnabled.checked,
                            sr_mode:srMode,sr_blend:+srBlend.value})});
     const j=await r.json();
     if(!r.ok||j.error)throw new Error(j.error||("HTTP "+r.status));
-    key=j.key;outData=j.result;afterimg.src=outData;
+    key=j.key;outData=j.result;afterimg.src=j.preview||outData;
     lastMs=j.ms;lastCached=j.cached;outW=j.w;outH=j.h;
-    dl.disabled=dlcmp.disabled=false;updStatus();
+    dl.disabled=false;dlcmp.disabled=!!j.preview;updStatus();
   }catch(e){fail(t("errPrefix")+e.message);}
   finally{
     busy.classList.remove("on");pending=false;
@@ -721,7 +750,8 @@ dl.onclick=()=>{
   if(!outData)return;
   const fx=(+micro.value||+detail.value||+cas.value||+grain.value)?"_fx":"";
   const sr=srMode==="off"?"":`_sr${srMode}`;
-  saveBlobUrl(outData,`${baseName()}_clean_a${(+slider.value).toFixed(2)}${fx}${sr}.png`,false);
+  const fine=fineEnabled.checked?`_fine_m${micro.value}_s${spots.value}_p${preserve.value}`:"_legacy";
+  saveBlobUrl(outData,`${baseName()}_clean_a${(+slider.value).toFixed(2)}${fine}${fx}${sr}.png`,false);
 };
 /* Compose the pair at full resolution, not at the on-screen size: the point of the
    export is to inspect detail, and exporting the scaled view would throw that away.
@@ -749,6 +779,7 @@ $("#reset").onclick=()=>{
   srcData=outData=key=null;fname="";lastMs=outW=outH=null;fit=true;dl.disabled=dlcmp.disabled=true;
   srMode="off";
   micro.value="0.55";detail.value="0";cas.value="0";grain.value="0";srBlend.value="0.35";
+  spots.value="0.35";preserve.value="0.65";fineEnabled.checked=true;showMask.checked=false;
   onRestore();
   thumb.classList.remove("on");cmp.style.display="none";emptyMsg.style.display="";
   $("#seg").querySelectorAll("button").forEach(x=>
@@ -781,7 +812,7 @@ def _decode(z, dz, alpha, H, W):
     with torch.no_grad(), _autocast_context(dev, dtype):
         y = STATE["dec"](z + alpha * dz)
     y = ((y.float().clamp(-1, 1) + 1) / 2)[0, :, :H, :W]
-    return (y.permute(1, 2, 0).cpu().numpy() * 255).round().astype(np.uint8)
+    return y.permute(1, 2, 0).cpu().numpy()
 
 
 def _realesrgan(arr_u8, target_scale, blend):
@@ -944,10 +975,20 @@ def _add_grain(arr_u8, amount, seed):
 
 
 def process(img_b64, alpha, key, micro=0.0, detail=0.0, cas=0.0, grain=0.0,
-            sr_mode="off", sr_blend=0.35):
+            sr_mode="off", sr_blend=0.35, fine_enabled=False, spots=0.35,
+            preserve=0.65, show_mask=False):
+    values = (alpha, micro, detail, cas, grain, sr_blend, spots, preserve)
+    if not all(np.isfinite(v) for v in values):
+        raise ValueError("Cleanup settings must be finite numbers")
+    alpha = float(np.clip(alpha, 0, 2))
+    micro, detail, cas, sr_blend, spots, preserve = (
+        float(np.clip(v, 0, 1)) for v in (micro, detail, cas, sr_blend, spots, preserve))
+    if sr_mode not in {"off", "1x", "2x"}:
+        raise ValueError("unknown Real-ESRGAN mode")
     raw = base64.b64decode(img_b64.split(",", 1)[-1])
     arr = np.asarray(Image.open(io.BytesIO(raw)).convert("RGB"))
-    k = key or hashlib.md5(raw).hexdigest()
+    # Never let a stale browser key pair another image with a cached latent.
+    k = hashlib.md5(raw).hexdigest()
     t0 = time.time()
     with LOCK:                                  # serialise GPU work across requests
         hit = k in CACHE
@@ -958,21 +999,44 @@ def process(img_b64, alpha, key, micro=0.0, detail=0.0, cas=0.0, grain=0.0,
             # mode keeps the original pixels instead of replacing them with a
             # slightly softer VAE reconstruction.
             baseline = _decode(z, dz, 0.0, H, W)
-            CACHE[k] = (z, dz, H, W, baseline)
+            CACHE[k] = dict(z=z, dz=dz, H=H, W=W, baseline=baseline,
+                            last_alpha=0.0, decoded=baseline)
             CACHE_ORDER.append(k)
             while len(CACHE_ORDER) > STATE["cache_n"]:
                 CACHE.pop(CACHE_ORDER.pop(0), None)
-        z, dz, H, W, baseline = CACHE[k]
-        decoded = _decode(z, dz, alpha, H, W)
-        delta = decoded.astype(np.int16) - baseline.astype(np.int16)
-        out = np.clip(arr.astype(np.int16) + delta, 0, 255).astype(np.uint8)
-        if sr_mode not in {"off", "1x", "2x"}:
-            raise ValueError("unknown Real-ESRGAN mode")
-        if sr_mode != "off":
-            out = _realesrgan(out, 1 if sr_mode == "1x" else 2, sr_blend)
-        out = _suppress_micro_pattern(out, micro)
+        entry = CACHE[k]
+        if entry["last_alpha"] != alpha:
+            decoded = _decode(entry["z"], entry["dz"], alpha, entry["H"], entry["W"])
+            entry.update(last_alpha=alpha, decoded=decoded)
+        baseline, decoded = entry["baseline"], entry["decoded"]
+        if fine_enabled and "masks" not in entry:
+            entry["masks"] = fine_cleanup.analyze(arr)
+        # Keep only the most recent processed image per entry, not every slider value.
+        stage_key = (alpha, fine_enabled, micro, spots, preserve, sr_mode, sr_blend)
+        if entry.get("stage_key") != stage_key:
+            if fine_enabled:
+                out = fine_cleanup.compose(arr, baseline, decoded, entry["masks"], preserve, alpha)
+                out = fine_cleanup.clean(out, entry["masks"], micro, spots)
+            else:
+                # Preserve the previous 8-bit path for meaningful A/B comparison.
+                delta = (decoded * 255).round().astype(np.int16) - (baseline * 255).round().astype(np.int16)
+                out = np.clip(arr.astype(np.int16) + delta, 0, 255).astype(np.uint8)
+            if sr_mode != "off":
+                out = _realesrgan(out, 1 if sr_mode == "1x" else 2, sr_blend)
+            if not fine_enabled:
+                out = _suppress_micro_pattern(out, micro)
+            entry.update(stage_key=stage_key, prepared=out)
+        out = entry["prepared"]
         out = _frequency_and_cas(out, detail, cas)
         out = _add_grain(out, grain, int(k[:16], 16))
+        preview = None
+        if show_mask and fine_enabled:
+            marked = fine_cleanup.overlay(arr, entry["masks"], micro, spots,
+                                          1 - (1 - preserve) * min(alpha, 1))
+            marked = Image.fromarray(marked).resize((out.shape[1], out.shape[0]))
+            preview_buf = io.BytesIO()
+            marked.save(preview_buf, format="PNG", compress_level=1)
+            preview = "data:image/png;base64," + base64.b64encode(preview_buf.getvalue()).decode()
     buf = io.BytesIO()
     # PNG avoids adding lossy compression artifacts or softness to an image whose
     # fine detail is the entire reason for using the cleaner.
@@ -985,7 +1049,8 @@ def process(img_b64, alpha, key, micro=0.0, detail=0.0, cas=0.0, grain=0.0,
     gc.collect()
     out_h, out_w = out.shape[:2]
     return dict(result="data:image/png;base64," + base64.b64encode(buf.getvalue()).decode(),
-                key=k, w=out_w, h=out_h, ms=int((time.time() - t0) * 1000), cached=hit)
+                key=k, w=out_w, h=out_h, ms=int((time.time() - t0) * 1000), cached=hit,
+                preview=preview)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1020,7 +1085,9 @@ class Handler(BaseHTTPRequestHandler):
                           float(req.get("micro", 0.0)), float(req.get("detail", 0.0)),
                           float(req.get("cas", 0.0)),
                           float(req.get("grain", 0.0)), req.get("sr_mode", "off"),
-                          float(req.get("sr_blend", 0.35)))
+                          float(req.get("sr_blend", 0.35)), bool(req.get("fine_enabled", False)),
+                          float(req.get("spots", 0.35)), float(req.get("preserve", 0.65)),
+                          bool(req.get("show_mask", False)))
             body = json.dumps(out).encode()
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()

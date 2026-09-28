@@ -56,6 +56,25 @@ class FineCleanupTests(unittest.TestCase):
         out = fine.compose(rgb, baseline, baseline, masks, 0, 1)
         self.assertLess(out[16, 16, 0], rgb[16, 16, 0])
 
+    def test_aperiodic_clustered_texture_is_not_ignored(self):
+        y, x = np.mgrid[:96, :96]
+        field = np.round(128 + 15 * np.sin(1.7*x + 0.011*y*y) *
+                         np.sin(1.3*y + 0.013*x*x)).astype(np.uint8)
+        rgb = np.repeat(field[..., None], 3, axis=2)
+        out = fine.clean(rgb, fine.analyze(rgb), 1, 0)
+        self.assertGreater(np.any(out != rgb, axis=2).mean(), 0.20)
+        self.assertLess(out.std(), rgb.std() * 0.90)
+
+    def test_sharpening_respects_cleanup_protection(self):
+        y, x = np.mgrid[:32, :32]
+        field = (100 + 30 * ((x + y) % 2)).astype(np.uint8)
+        rgb = np.repeat(field[..., None], 3, axis=2)
+        protected = webui._frequency_and_cas(rgb, 1, 1, np.ones(field.shape))
+        np.testing.assert_array_equal(protected, rgb)
+        unprotected = webui._frequency_and_cas(rgb, 1, 1, np.zeros(field.shape))
+        np.testing.assert_array_equal(unprotected, webui._frequency_and_cas(rgb, 1, 1))
+        self.assertGreater(np.abs(unprotected.astype(int) - rgb).max(), 0)
+
     def test_small_images(self):
         for shape in ((1, 1, 3), (2, 5, 3)):
             rgb = np.full(shape, 127, np.uint8)

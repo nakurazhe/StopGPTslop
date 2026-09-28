@@ -927,10 +927,11 @@ def _suppress_micro_pattern(arr_u8, amount):
     return np.clip(output * 255.0, 0, 255).round().astype(np.uint8)
 
 
-def _frequency_and_cas(arr_u8, detail, cas):
+def _frequency_and_cas(arr_u8, detail, cas, protection=None):
     """Luminance frequency split followed by contrast-adaptive sharpening."""
     detail, cas = float(np.clip(detail, 0, 1)), float(np.clip(cas, 0, 1))
     image = arr_u8.astype(np.float32) / 255.0
+    original = image
     if detail > 0:
         pil = Image.fromarray(arr_u8)
         small = np.asarray(pil.filter(ImageFilter.GaussianBlur(0.65))).astype(np.float32) / 255.0
@@ -957,6 +958,8 @@ def _frequency_and_cas(arr_u8, detail, cas):
                  rgb[1:-1, :-2] + rgb[1:-1, 2:])
         sharpened = (image + weight[..., None] * cross) / (1 + 4 * weight[..., None])
         image = np.clip(image + cas * (sharpened - image), 0, 1)
+    if protection is not None:
+        image = original + (image - original) * (1 - np.clip(protection, 0, 1))[..., None]
     return (image * 255).round().astype(np.uint8)
 
 
@@ -1015,8 +1018,15 @@ def process(img_b64, alpha, key, micro=0.0, detail=0.0, cas=0.0, grain=0.0,
         stage_key = (alpha, fine_enabled, micro, spots, preserve, sr_mode, sr_blend)
         if entry.get("stage_key") != stage_key:
             if fine_enabled:
-                out = fine_cleanup.compose(arr, baseline, decoded, entry["masks"], preserve, alpha)
-                out = fine_cleanup.clean(out, entry["masks"], micro, spots)
+                compose_key = (alpha, preserve)
+                if entry.get("compose_key") != compose_key:
+                    composed = fine_cleanup.compose(arr, baseline, decoded, entry["masks"], preserve, alpha)
+                    # Detect the remaining texture after the latent correction:
+                    # strong source edges may already have been softened by it.
+                    cleanup_masks = fine_cleanup.analyze(composed)
+                    entry.update(compose_key=compose_key, composed=composed,
+                                 cleanup_masks=cleanup_masks)
+                out = fine_cleanup.clean(entry["composed"], entry["cleanup_masks"], micro, spots)
             else:
                 # Preserve the previous 8-bit path for meaningful A/B comparison.
                 delta = (decoded * 255).round().astype(np.int16) - (baseline * 255).round().astype(np.int16)
@@ -1027,11 +1037,22 @@ def process(img_b64, alpha, key, micro=0.0, detail=0.0, cas=0.0, grain=0.0,
                 out = _suppress_micro_pattern(out, micro)
             entry.update(stage_key=stage_key, prepared=out)
         out = entry["prepared"]
-        out = _frequency_and_cas(out, detail, cas)
+        protection = None
+        if fine_enabled:
+            masks = entry["cleanup_masks"]
+            protection = np.maximum(micro * masks["pattern"], spots * masks["dots"])
+            protection = np.maximum(protection, (1 - preserve) * min(alpha, 1) *
+                                    np.maximum(entry["masks"]["pattern"], entry["masks"]["dots"]))
+            if protection.shape != out.shape[:2]:
+                protection = np.asarray(Image.fromarray(protection).resize(
+                    (out.shape[1], out.shape[0]), Image.Resampling.BILINEAR))
+        out = _frequency_and_cas(out, detail, cas, protection)
         out = _add_grain(out, grain, int(k[:16], 16))
         preview = None
         if show_mask and fine_enabled:
-            marked = fine_cleanup.overlay(arr, entry["masks"], micro, spots,
+            display_masks = {name: np.maximum(entry["masks"][name], entry["cleanup_masks"][name])
+                             for name in ("pattern", "dots")}
+            marked = fine_cleanup.overlay(arr, display_masks, micro, spots,
                                           1 - (1 - preserve) * min(alpha, 1))
             marked = Image.fromarray(marked).resize((out.shape[1], out.shape[0]))
             preview_buf = io.BytesIO()

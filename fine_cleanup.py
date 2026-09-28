@@ -61,8 +61,8 @@ def analyze(image_u8):
                    - np.asarray(gray.filter(ImageFilter.MinFilter(5)), dtype=np.float32)) / 255
     protection *= 1 - smoothstep(0.22, 0.40, local_range)
 
-    # Positive correlation at short lags in BOTH axes favors repeated speckle
-    # over an isolated line. It cannot distinguish artificial grids from fabric.
+    # Repetition increases confidence, but is not mandatory: actual generated
+    # micro-patterns are often irregular or directional, unlike a perfect grid.
     energy = box_mean(fine * fine, 3)
     repeats = []
     for axis in (0, 1):
@@ -73,9 +73,11 @@ def analyze(image_u8):
             denominator = np.sqrt(energy * box_mean(shifted * shifted, 3)) + 1e-8
             best = np.maximum(best, correlation / denominator)
         repeats.append(best)
-    periodic = smoothstep(0.15, 0.65, np.minimum(*repeats))
-    texture = smoothstep(0.006, 0.035, np.sqrt(energy))
-    pattern = np.clip(box_mean(texture * periodic * protection, 1) * protection, 0, 1)
+    periodic = smoothstep(0.15, 0.65, np.maximum(*repeats))
+    texture = smoothstep(0.004, 0.025, np.sqrt(energy))
+    # Apply protection once; multiplying it twice made the mask nearly empty
+    # on real, irregular texture even with the strength slider at maximum.
+    pattern = np.clip(box_mean(texture * (0.45 + 0.55 * periodic), 1) * protection, 0, 1)
 
     # Require disagreement with every neighbor, with the same sign. Averaging
     # opposing pairs would incorrectly classify pixels next to letter corners.
@@ -103,6 +105,27 @@ def compose(source_u8, baseline, decoded, masks, preserve, alpha):
     return np.clip(result * 255, 0, 255).round().astype(np.uint8)
 
 
+def _surface_base(image):
+    """Small edge-aware neighborhood for clustered 1–4 px texture.
+
+    Luminance differences reduce cross-edge mixing. Unlike a Gaussian base,
+    opposite sides of a contour do not contribute equally to the average.
+    """
+    h, w = image.shape[:2]
+    padded = np.pad(image, ((2, 2), (2, 2), (0, 0)), mode="edge")
+    luma = image @ LUMA
+    total = np.zeros_like(image)
+    weights = np.zeros((h, w), np.float32)
+    for dy in range(-2, 3):
+        for dx in range(-2, 3):
+            neighbor = padded[2 + dy:2 + dy + h, 2 + dx:2 + dx + w]
+            distance = (neighbor @ LUMA - luma) / 0.065
+            weight = np.exp(-0.5 * distance * distance - (dx * dx + dy * dy) / 4.5)
+            total += neighbor * weight[..., None]
+            weights += weight
+    return total / weights[..., None]
+
+
 def clean(image_u8, masks, micro, spots):
     """Bounded, masked corrections; never blur the whole output image."""
     image = image_u8.astype(np.float32) / 255
@@ -110,8 +133,11 @@ def clean(image_u8, masks, micro, spots):
     if micro > 0:
         base = np.asarray(Image.fromarray(image_u8).filter(ImageFilter.GaussianBlur(0.65)),
                           dtype=np.float32) / 255
-        correction = np.clip(image - base, -0.10, 0.10)
-        output -= micro * 0.75 * masks["pattern"][..., None] * correction
+        # A subpixel Gaussian alone barely reaches clustered remnants. Most of
+        # the correction now comes from a wider, edge-aware neighborhood.
+        surface = _surface_base(image)
+        correction = np.clip(0.25 * (image - base) + 0.75 * (image - surface), -0.12, 0.12)
+        output -= micro * masks["pattern"][..., None] * correction
     if spots > 0:
         median = np.asarray(Image.fromarray(image_u8).filter(ImageFilter.MedianFilter(3)),
                             dtype=np.float32) / 255

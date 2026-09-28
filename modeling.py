@@ -25,19 +25,38 @@ import argparse
 import glob
 import os
 import sys
+import tempfile
 import time
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageOps
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXTS = (".webp", ".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
 # Input dimensions must be multiples of 32; images are padded up and cropped back.
 ALIGN = 32
+
+
+def read_image(path):
+    """Decode one still image in its displayed EXIF orientation."""
+    with Image.open(path) as image:
+        if getattr(image, "n_frames", 1) != 1:
+            raise ValueError("Animated/multi-page images are not supported")
+        return np.asarray(ImageOps.exif_transpose(image).convert("RGB"))
+
+
+def pad_to_alignment(x):
+    h, w = x.shape[-2:]
+    ph, pw = (-h) % ALIGN, (-w) % ALIGN
+    if ph or pw:
+        # Reflect padding requires the padding to be smaller than the input.
+        x = F.pad(x, (0, pw, 0, ph), mode="reflect" if ph < h and pw < w else "replicate")
+    return x
 
 
 # ------------------------------------------------------------------------------ model
@@ -205,10 +224,9 @@ def restore(arr_u8, enc_fn, dec_fn, R, alpha, device, dtype):
     H, W = arr_u8.shape[:2]
     x = torch.from_numpy(arr_u8.astype(np.float32) / 255.0)
     x = x.permute(2, 0, 1).unsqueeze(0).to(device)
-    ph, pw = (-H) % ALIGN, (-W) % ALIGN
-    if ph or pw:
-        x = F.pad(x, (0, pw, 0, ph), mode="reflect")
-    with torch.autocast(device_type=device.split(":")[0], dtype=dtype):
+    x = pad_to_alignment(x)
+    context = torch.autocast(device_type="cuda", dtype=dtype) if device.split(":")[0] == "cuda" and dtype != torch.float32 else nullcontext()
+    with context:
         z = enc_fn(x * 2 - 1)
         if alpha != 0.0:
             z = z + alpha * R(z)
@@ -222,12 +240,21 @@ def save_image(path, arr_u8, quality=95, webp_method=0):
     size); `quality` is the image-quality knob. Method 0 is ~3x faster to encode."""
     im = Image.fromarray(arr_u8)
     ext = os.path.splitext(path)[1].lower()
-    if ext == ".webp":
-        im.save(path, quality=quality, method=webp_method)
-    elif ext in (".jpg", ".jpeg"):
-        im.save(path, quality=quality)
-    else:
-        im.save(path)
+    # A failed write must not leave an apparently completed file for batch resume.
+    fd, temporary = tempfile.mkstemp(prefix=".stopgptslop-", suffix=ext,
+                                     dir=os.path.dirname(os.path.abspath(path)))
+    os.close(fd)
+    try:
+        if ext == ".webp":
+            im.save(temporary, quality=quality, method=webp_method)
+        elif ext in (".jpg", ".jpeg"):
+            im.save(temporary, quality=quality)
+        else:
+            im.save(temporary)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 # --------------------------------------------------------------------------- CLI
@@ -236,7 +263,7 @@ def collect_inputs(path, recursive):
         return [path]
     pat = "**/*" if recursive else "*"
     fs = glob.glob(os.path.join(path, pat), recursive=recursive)
-    return sorted(f for f in fs if os.path.splitext(f)[1].lower() in EXTS)
+    return sorted(f for f in fs if os.path.isfile(f) and os.path.splitext(f)[1].lower() in EXTS)
 
 
 def main():
@@ -285,8 +312,18 @@ def main():
     p.add_argument("--workers", type=int, default=3,
                    help="background threads for reading and encoding, 0 to run synchronously")
     args = p.parse_args()
+    if not np.isfinite(args.alpha) or not 0 <= args.alpha <= 2:
+        p.error("--alpha must be finite and between 0 and 2")
+    if args.workers < 0:
+        p.error("--workers must be nonnegative")
 
     files = collect_inputs(args.input, args.recursive)
+    if os.path.isdir(args.input):
+        input_root = os.path.normcase(os.path.realpath(args.input))
+        output_root = os.path.normcase(os.path.realpath(args.output))
+        # Never feed prior results back into a recursive run.
+        if output_root.startswith(input_root + os.sep):
+            files = [f for f in files if not os.path.normcase(os.path.realpath(f)).startswith(output_root + os.sep)]
     if not files:
         sys.exit(f"No images found in {args.input}")
     os.makedirs(args.output, exist_ok=True)
@@ -296,7 +333,15 @@ def main():
         ext = os.path.splitext(f)[1].lower() if args.format == "keep" else "." + args.format
         if ext not in EXTS:
             ext = ".webp"
-        return os.path.join(args.output, stem + ext)
+        subdir = os.path.dirname(os.path.relpath(f, args.input)) if os.path.isdir(args.input) else ""
+        return os.path.join(args.output, subdir, stem + ext)
+
+    destinations = [os.path.normcase(os.path.realpath(dst_of(f))) for f in files]
+    if len(set(destinations)) != len(destinations):
+        p.error("Multiple inputs map to the same output filename; separate them before conversion")
+    source_paths = {os.path.normcase(os.path.realpath(f)) for f in files}
+    if any(dst in source_paths for dst in destinations):
+        p.error("Output would overwrite an input; choose a separate output directory")
 
     todo = files if args.overwrite else [f for f in files if not os.path.exists(dst_of(f))]
     if len(todo) < len(files):
@@ -306,7 +351,7 @@ def main():
         print(f"Nothing to do. Output directory: {args.output}", flush=True)
         return
 
-    dtype = torch.float32 if args.fp32 else torch.bfloat16
+    dtype = torch.float32 if args.fp32 or args.device.split(":")[0] != "cuda" else torch.bfloat16
     do_compile = (args.compile == "on"
                   or (args.compile == "auto" and len(todo) >= args.compile_min))
     t0 = time.time()
@@ -330,9 +375,10 @@ def main():
     pool = ThreadPoolExecutor(max_workers=args.workers) if args.workers else None
 
     def read(f):
-        return np.asarray(Image.open(f).convert("RGB"))
+        return read_image(f)
 
     def write(dst, src_u8, out_u8):
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
         if args.side_by_side:
             gap = np.full((out_u8.shape[0], 6, 3), 255, np.uint8)
             out_u8 = np.concatenate([src_u8, gap, out_u8], 1)
@@ -343,6 +389,19 @@ def main():
     pend = []
     nxt = pool.submit(read, todo[0]) if pool else None
     failed = []
+    def finish_writes(wait=False):
+        nonlocal pend
+        remaining = []
+        for future, path, pixels in pend:
+            if wait or future.done():
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"! Could not save {path}: {e}", flush=True)
+                    failed.append(path)
+            else:
+                remaining.append((future, path, pixels))
+        pend = remaining
     for i, f in enumerate(todo):
         try:
             arr = nxt.result() if pool else read(f)
@@ -363,13 +422,22 @@ def main():
             failed.append(f)
             torch.cuda.empty_cache()
             continue
-        dt = time.time() - t1
+        except Exception as e:
+            print(f"! Could not process {os.path.basename(f)}: {e}", flush=True)
+            failed.append(f)
+            continue
+        dt = max(time.time() - t1, 1e-9)
         dst = dst_of(f)
         if pool:
-            pend = [q for q in pend if not q.done()]
-            pend.append(pool.submit(write, dst, arr, out))
+            finish_writes(wait=len(pend) >= max(1, args.workers * 2))
+            pend.append((pool.submit(write, dst, arr, out), f, H * W))
         else:
-            write(dst, arr, out)
+            try:
+                write(dst, arr, out)
+            except Exception as e:
+                print(f"! Could not save {dst}: {e}", flush=True)
+                failed.append(f)
+                continue
         done_px += H * W
         el = time.time() - t_start
         eta = el / (i + 1) * (len(todo) - i - 1)
@@ -377,8 +445,7 @@ def main():
               f"{dt:5.2f}s ({H*W/1e6/dt:.2f} MP/s)  ETA {eta/60:4.1f}min", flush=True)
 
     if pool:
-        for q in pend:
-            q.result()
+        finish_writes(wait=True)
         pool.shutdown(wait=True)
     el = time.time() - t_start
     print(f"Done: {len(todo)-len(failed)}/{len(todo)} image(s), {done_px/1e6:.1f}MP in "
@@ -387,6 +454,8 @@ def main():
     if failed:
         print(f"Failed on {len(failed)}: {[os.path.basename(f) for f in failed[:5]]}", flush=True)
     print(f"Output: {args.output}", flush=True)
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

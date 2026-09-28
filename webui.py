@@ -9,8 +9,8 @@ before and after. Language and theme both follow the operating system.
 Notes:
 - Uses only the standard library's http.server; images travel as base64 JSON, which
   avoids multipart parsing. No web framework needed.
-- Changing the strength only re-runs the decoder: the encoder output is cached per
-  image, which makes dragging the slider feel roughly four times more responsive.
+- Processing starts only on Generate. A queue uses one settings snapshot and
+  runs sequentially; changing controls never starts GPU work.
 - Model definitions come from modeling.py in this directory, so there is only ever
   one copy of them.
 - The image pixels are never recoloured by the theme; only the surrounding workspace
@@ -32,15 +32,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from PIL import Image, ImageFilter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TORPH_JS = os.path.join(HERE, "node_modules", "torph", "dist", "index.mjs")
 sys.path.insert(0, HERE)
 # Model definitions live in modeling.py so there is only one copy of them
-from modeling import (ALIGN, build_fns, load_vae, load_refiner_model,
-                      load_realesrgan_model)  # noqa: E402
+from modeling import (build_fns, load_vae, load_refiner_model,
+                      load_realesrgan_model, read_image, pad_to_alignment)  # noqa: E402
 import fine_cleanup
 import color_cleanup
 
@@ -48,6 +46,25 @@ STATE = {}
 CACHE = {}
 CACHE_ORDER = []
 LOCK = threading.Lock()
+MAX_REQUEST_BYTES = 56 * 1024 * 1024
+MAX_IMAGE_PIXELS = 24_000_000
+MAX_OUTPUT_PIXELS = 40_000_000
+CACHE_BYTES = 512 * 1024 * 1024
+
+
+def _cache_size(value):
+    if isinstance(value, np.ndarray):
+        return value.nbytes
+    if isinstance(value, torch.Tensor):
+        return value.numel() * value.element_size()
+    if isinstance(value, dict):
+        return sum(_cache_size(v) for v in value.values())
+    return 0
+
+
+def _trim_cache():
+    while CACHE_ORDER and (len(CACHE_ORDER) > STATE.get("cache_n", 4) or _cache_size(CACHE) > CACHE_BYTES):
+        CACHE.pop(CACHE_ORDER.pop(0), None)
 
 
 def _autocast_context(device, dtype):
@@ -336,6 +353,30 @@ input[type=range]:active::-webkit-slider-thumb{transform:scale(1.14)}
   .panel{max-height:48vh;padding:0}.grp{border-radius:17px;margin-bottom:8px}.stagewrap{border-radius:19px}
 }
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+/* Manual jobs, local presets and bounded sequential queue. */
+[hidden]{display:none!important}
+button:disabled{opacity:.42;cursor:default}
+select,input[type=text]{width:100%;min-width:0;padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--raised);color:var(--ink);font:inherit}
+select:focus-visible,#drop:focus-visible,#bar:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+#queue{display:flex;flex-direction:column;gap:5px;max-height:210px;overflow:auto}
+.queue-row{display:flex;gap:4px;min-width:0;border:1px solid var(--line);border-radius:10px}
+.queue-row.selected{border-color:var(--accent);background:var(--accent-soft)}
+.queue-pick{flex:1;min-width:0;text-align:left;padding:8px;font-size:12px}
+.queue-pick span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.queue-pick small{color:var(--muted)}
+.queue-remove{width:32px;flex-shrink:0}
+.sm{font-size:12px;color:var(--muted);margin:0;line-height:1.45}
+#queueStatus{min-height:17px}
+.panel{overflow:hidden}
+.settings-scroll{flex:1;min-height:0;overflow:auto;scrollbar-width:thin}
+.runbar{flex-shrink:0;display:flex;flex-direction:column;gap:6px;padding:10px 0 0}
+#bar{pointer-events:auto;cursor:ew-resize}
+#cmp{border-radius:0}
+.status{height:auto;min-height:30px;flex-wrap:wrap;overflow-wrap:anywhere}
+.top{flex-wrap:wrap;min-height:66px;height:auto;padding:10px 8px}
+.top .pri,.top .gho{padding:8px 12px;min-height:36px}
+@media(max-width:900px){.split{grid-template-rows:minmax(180px,42vh) minmax(220px,1fr)}.panel{max-height:none}#wrap{min-height:0}}
+@media(max-width:520px){.top{gap:6px}.top h1{font-size:14px}.top .mark{display:none}.top .icon{width:30px;height:30px}.top .pri,.top .gho{font-size:11px;padding:7px}.split{grid-template-rows:minmax(160px,40vh) minmax(180px,1fr)}}
 </style></head><body>
 <div class="app">
   <div class="top">
@@ -344,16 +385,19 @@ input[type=range]:active::-webkit-slider-thumb{transform:scale(1.14)}
     <span class="grow"></span>
     <button class="icon num" id="lang" title="Language">EN</button>
     <button class="icon" id="theme" title="Theme">◑</button>
+    <button class="pri" id="dl" disabled data-i="download"></button>
+    <button class="gho" id="reset" disabled data-i="clear"></button>
   </div>
 
   <div class="split">
     <aside class="panel">
+      <div class="settings-scroll">
       <div class="grp">
         <span class="eyebrow" data-i="secInput"></span>
-        <div id="drop">
+        <div id="drop" role="button" tabindex="0">
           <div class="big" data-i="dropBig"></div>
           <div class="sm" id="dropSm"></div>
-          <input type="file" id="file" accept="image/*" hidden>
+          <input type="file" id="file" accept="image/png,image/jpeg,image/webp,image/bmp" multiple hidden>
         </div>
         <div id="thumb">
           <img id="tImg" alt="">
@@ -362,6 +406,21 @@ input[type=range]:active::-webkit-slider-thumb{transform:scale(1.14)}
             <div class="td num" id="tDim"></div>
           </div>
         </div>
+        <div id="queue" aria-label="Queue"></div>
+        <p class="sm" id="queueStatus" role="status" aria-live="polite"></p>
+        <p class="sm" data-i="queueHint"></p>
+      </div>
+
+      <div class="grp">
+        <label class="eyebrow" for="userPresets" data-i="userPresets"></label>
+        <select id="userPresets"></select>
+        <label class="hint" for="presetName" data-i="presetName"></label>
+        <input id="presetName" type="text" maxlength="60" autocomplete="off">
+        <div class="acts">
+          <button class="gho" id="savePreset" data-i="savePreset"></button>
+          <button class="gho" id="deletePreset" disabled data-i="deletePreset"></button>
+        </div>
+        <p class="sm" data-i="presetHint"></p>
       </div>
 
       <div class="grp">
@@ -423,14 +482,11 @@ input[type=range]:active::-webkit-slider-thumb{transform:scale(1.14)}
         <input type="range" id="srBlend" min="0" max="1" step="0.05" value="0.35">
       </div>
 
-      <div class="grp">
-        <div class="acts">
-          <button class="pri wide" id="dl" disabled data-i="download"></button>
-          <button class="gho" id="dlcmp" disabled data-i="downloadCmp"></button>
-          <button class="gho" id="reset" data-i="clear"></button>
-        </div>
       </div>
-
+      <div class="runbar">
+        <button class="pri" id="generate" disabled data-i="generate"></button>
+        <button class="gho" id="stop" hidden data-i="stop"></button>
+      </div>
     </aside>
 
     <div class="stagewrap">
@@ -440,7 +496,7 @@ input[type=range]:active::-webkit-slider-thumb{transform:scale(1.14)}
         <div id="cmp" style="display:none">
           <img id="before" alt="" draggable="false">
           <div id="after"><img id="afterimg" alt="" draggable="false"></div>
-          <div id="bar"></div>
+          <div id="bar" role="slider" tabindex="0" aria-label="Before / after" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50"></div>
           <div class="tag l" data-i="tagBefore"></div>
           <div class="tag r" data-i="tagAfter"></div>
           <div id="busy" data-i="working"></div>
@@ -460,7 +516,7 @@ const I18N={
      secAlpha:"清理力度",alphaUnit:"alpha",
      p25:"保守",p50:"平衡",p75:"强力",p100:"激进",
      secView:"视图",viewFit:"适应窗口",viewActual:"1:1",
-     download:"下载结果",downloadCmp:"下载对比图",clear:"清空",
+     download:"下载结果",clear:"清空",
      errExport:"导出失败：",
      tagBefore:"原图",tagAfter:"处理后",working:"处理中…",
      emptyHint:"左侧拖入或粘贴图片后，在此处拖动中缝对比",
@@ -472,7 +528,7 @@ const I18N={
      secAlpha:"Сила очистки",alphaUnit:"alpha",
      p25:"Бережно",p50:"Сбалансированно",p75:"Сильно",p100:"Агрессивно",
      secView:"Просмотр",viewFit:"Вместить",viewActual:"1:1",
-     download:"Скачать PNG",downloadCmp:"Скачать сравнение",clear:"Очистить",
+     download:"Скачать PNG",clear:"Очистить",
      errExport:"Ошибка экспорта: ",
      tagBefore:"До",tagAfter:"После",working:"Обработка…",
      emptyHint:"Перетащите или вставьте изображение слева, затем двигайте разделитель для сравнения",
@@ -484,7 +540,7 @@ const I18N={
      secAlpha:"Cleanup strength",alphaUnit:"alpha",
      p25:"Conservative",p50:"Balanced",p75:"Strong",p100:"Aggressive",
      secView:"View",viewFit:"Fit",viewActual:"1:1",
-     download:"Download",downloadCmp:"Download comparison",clear:"Clear",
+     download:"Download",clear:"Clear",
      errExport:"Export failed: ",
      tagBefore:"Before",tagAfter:"After",working:"Working…",
      emptyHint:"Drop or paste an image on the left, then drag the divider here to compare",
@@ -538,290 +594,325 @@ Object.assign(I18N.zh,{
   colorHint:"独立的 CPU 滤镜。建议从 0.50 开始；零关闭对应效果。抖动仅在去色带时生效，与颗粒无关。上方橙色蒙版仅显示微纹理清理。"
 });
 
-const navLang=(navigator.language||"en").toLowerCase();
-let lang=navLang.startsWith("zh")?"zh":navLang.startsWith("ru")?"ru":"en";
-lang=localStorage.getItem("stopGPTslop.lang")||lang;
-const t=k=>(I18N[lang][k]??k);
-function paint(){
-  document.documentElement.lang=lang;
-  document.title=t("appName");
-  document.querySelectorAll("[data-i]").forEach(el=>el.textContent=t(el.dataset.i));
-  $("#dropSm").innerHTML=t("dropSm");
-  $("#lang").textContent=lang==="ru"?"EN":lang==="en"?"中":"RU";
-  $("#presets").innerHTML=PRESETS.map(([v,k])=>
-    `<button data-a="${v}"><b class="num">${v.toFixed(2)}</b>${t(k)}</button>`).join("");
-  $("#presets").querySelectorAll("button").forEach(b=>b.onclick=()=>{
-    slider.value=b.dataset.a;onAlpha();});
-  markPresets();updStatus();
-}
-$("#lang").onclick=()=>{lang=lang==="ru"?"en":lang==="en"?"zh":"ru";
-  localStorage.setItem("stopGPTslop.lang",lang);paint();};
-
-const isDark=()=>document.documentElement.dataset.theme
-  ? document.documentElement.dataset.theme==="dark"
-  : matchMedia("(prefers-color-scheme:dark)").matches;
-const savedTheme=localStorage.getItem("stopGPTslop.theme");
-if(savedTheme)document.documentElement.dataset.theme=savedTheme;
-const paintTheme=()=>{$("#theme").textContent=isDark()?"☀":"☾";};
-paintTheme();
-$("#theme").onclick=()=>{const d=!isDark();
-  document.documentElement.dataset.theme=d?"dark":"light";
-  localStorage.setItem("stopGPTslop.theme",d?"dark":"light");paintTheme();};
-
-const drop=$("#drop"),file=$("#file"),slider=$("#a"),aval=$("#aval"),wrap=$("#wrap"),
-      cmp=$("#cmp"),before=$("#before"),afterimg=$("#afterimg"),after=$("#after"),bar=$("#bar"),
-      busy=$("#busy"),err=$("#err"),status=$("#status"),emptyMsg=$("#emptyMsg"),
-      thumb=$("#thumb"),dl=$("#dl"),dlcmp=$("#dlcmp"),
-      micro=$("#micro"),detail=$("#detail"),cas=$("#cas"),grain=$("#grain"),srBlend=$("#srBlend"),
-      spots=$("#spots"),preserve=$("#preserve"),fineEnabled=$("#fineEnabled"),showMask=$("#showMask"),
-      chroma=$("#chroma"),deband=$("#deband"),dither=$("#dither");
-let srcData=null,key=null,outData=null,fname="",seq=0,pending=false,fit=true,dispScale=1,
-    lastMs=null,lastCached=false,outW=null,outH=null,srMode="off",rerun=false;
-
-/* Torph performs the real digit-by-digit morph. Until its local ES module is ready,
-   values still update normally, so a missing optional animation can never break UI. */
-let TorphTextMorph=null;
-const morphs=new Map();
-function morphValue(el,value){
-  const text=String(value);
-  if(!TorphTextMorph){el.textContent=text;return;}
-  let morph=morphs.get(el);
-  if(!morph){
-    el.textContent="";
-    morph=new TorphTextMorph({element:el,locale:lang,
-      ease:{stiffness:200,damping:20,mass:1},numbers:true,scale:true});
-    morphs.set(el,morph);
-  }
-  morph.update(text);
-}
-import("/vendor/torph.mjs").then(({TextMorph})=>{
-  TorphTextMorph=TextMorph;
-  [aval,$("#microVal"),$("#detailVal"),$("#casVal"),$("#grainVal"),$("#srBlendVal")]
-    .forEach(el=>morphValue(el,el.textContent));
-}).catch(error=>console.warn("Torph unavailable; using static values",error));
-
-const rangeFill=el=>{
-  const pct=(+el.value-+el.min)/(+el.max-+el.min)*100;
-  el.style.setProperty("--fill",`${pct}%`);
+Object.assign(I18N.ru,{
+generate:"Генерировать",stop:"Остановить после текущего",stopping:"Остановка после текущего…",
+queueHint:"Настройки применяются ко всей очереди по кнопке. Готовые с теми же настройками пропускаются.",
+userPresets:"Мои пресеты",presetName:"Название пресета",savePreset:"Сохранить",deletePreset:"Удалить",
+presetHint:"Хранятся в этом браузере. Изображения и очередь не сохраняются после закрытия страницы.",
+choosePreset:"Выберите пресет",replacePreset:"Заменить пресет с таким названием?",removePreset:"Удалить выбранный пресет?",
+enterName:"Введите название пресета",storageError:"Браузер не разрешил сохранить настройки.",presetLimit:"Максимум 100 пресетов.",
+waiting:"Ожидает",ready:"Готово",changed:"Настройки изменены — нажмите «Генерировать»",error:"Ошибка",
+remove:"Убрать из очереди",queue:"Очередь",limits:"Лимит: 100 файлов, 40 МБ на файл, 512 МБ на очередь.",
+resultLimit:"Лимит памяти результатов (512 МБ). Скачайте готовые и уберите их из очереди.",
+clearConfirm:"Очистить очередь и результаты? Сначала скачайте нужные изображения.",
+emptyHint:"Добавьте изображения, настройте очистку и нажмите «Генерировать».",dropBig:"Добавить изображения",
+noPreview:"Формат не поддерживается браузером или файл повреждён.",
+timeout:"Сервер не ответил за 10 минут. Очередь остановлена; проверьте приложение перед повтором.",
+network:"Нет ответа сервера. Очередь остановлена; проверьте приложение перед повтором."
+});
+Object.assign(I18N.en,{
+generate:"Generate",stop:"Stop after current",stopping:"Stopping after current…",
+queueHint:"Settings apply to the queue only on Generate. Completed images with identical settings are skipped.",
+userPresets:"My presets",presetName:"Preset name",savePreset:"Save",deletePreset:"Delete",
+presetHint:"Stored in this browser. Images and queue are not retained after closing the page.",
+choosePreset:"Choose a preset",replacePreset:"Replace the preset with this name?",removePreset:"Delete the selected preset?",
+enterName:"Enter a preset name",storageError:"Browser could not save settings.",presetLimit:"Maximum 100 presets.",
+waiting:"Waiting",ready:"Done",changed:"Settings changed — press Generate",error:"Error",remove:"Remove from queue",queue:"Queue",
+limits:"Limit: 100 files, 40 MB each, 512 MB total.",resultLimit:"Result memory limit (512 MB). Download and remove completed images.",
+clearConfirm:"Clear queue and results? Download any images you need first.",
+emptyHint:"Add images, adjust settings, then press Generate.",dropBig:"Add images",noPreview:"Unsupported browser format or damaged image.",
+timeout:"No response in 10 minutes. Queue stopped; check the server before retrying.",
+network:"No server response. Queue stopped; check the server before retrying."
+});
+Object.assign(I18N.zh,{
+generate:"开始处理",stop:"当前图片完成后停止",stopping:"正在等待当前图片完成…",
+queueHint:"点击开始后将当前设置应用于队列。已完成且设置相同的图片会跳过。",
+userPresets:"我的预设",presetName:"预设名称",savePreset:"保存",deletePreset:"删除",
+presetHint:"保存在此浏览器中。关闭页面后不保留图片和队列。",
+choosePreset:"选择预设",replacePreset:"替换同名预设？",removePreset:"删除所选预设？",
+enterName:"请输入预设名称",storageError:"浏览器无法保存设置。",presetLimit:"最多保存100个预设。",
+waiting:"等待",ready:"完成",changed:"设置已更改，请点击开始处理",error:"错误",remove:"从队列移除",queue:"队列",
+limits:"最多100个文件，每个40 MB，总计512 MB。",resultLimit:"结果内存达到512 MB，请下载并移除已完成的图片。",
+clearConfirm:"清空队列和结果？请先下载需要的图片。",
+emptyHint:"添加图片，调整设置，然后点击开始处理。",dropBig:"添加图片",noPreview:"浏览器不支持此格式或文件已损坏。",
+timeout:"服务器10分钟内没有响应。队列已停止，请检查后重试。",network:"服务器无响应。队列已停止，请检查后重试。"
+});
+const storage={
+get(k){try{return localStorage.getItem(k);}catch{return null;}},
+set(k,v){try{localStorage.setItem(k,v);return true;}catch{return false;}}
 };
-document.querySelectorAll('input[type="range"]').forEach(range=>{
-  rangeFill(range);
-  range.addEventListener("input",()=>{
-    rangeFill(range);
-    range.animate([
-      {transform:"scaleX(1)"},{transform:"scaleX(.992)"},
-      {transform:"scaleX(1.006)"},{transform:"scaleX(1)"}
-    ],{duration:360,easing:"cubic-bezier(.19,1,.22,1)"});
-  });
-});
-document.addEventListener("pointerdown",event=>{
-  const button=event.target.closest("button");
-  if(!button||button.disabled)return;
-  button.animate([
-    {transform:"scale(1)"},{transform:"scale(.94)"},
-    {transform:"scale(1.025)"},{transform:"scale(.995)"},{transform:"scale(1)"}
-  ],{duration:430,easing:"cubic-bezier(.19,1,.22,1)"});
-});
-
-const fail=m=>{err.textContent=m;err.classList.add("on");busy.classList.remove("on");};
-const clearErr=()=>err.classList.remove("on");
-function markPresets(){
-  document.querySelectorAll("#presets button").forEach(b=>
-    b.classList.toggle("sel",Math.abs(+b.dataset.a-+slider.value)<1e-9));
+const navLang=(navigator.language||"en").toLowerCase();
+let lang=storage.get("stopGPTslop.lang")||(navLang.startsWith("zh")?"zh":navLang.startsWith("ru")?"ru":"en");
+if(!Object.hasOwn(I18N,lang))lang="en";
+const t=k=>I18N[lang][k]??k;
+const controls={alpha:$("#a"),micro:$("#micro"),spots:$("#spots"),preserve:$("#preserve"),
+detail:$("#detail"),cas:$("#cas"),grain:$("#grain"),sr_blend:$("#srBlend"),chroma:$("#chroma"),deband:$("#deband"),
+fine_enabled:$("#fineEnabled"),show_mask:$("#showMask"),dither:$("#dither")};
+const bools=new Set(["fine_enabled","show_mask","dither"]);
+const drop=$("#drop"),file=$("#file"),wrap=$("#wrap"),cmp=$("#cmp"),before=$("#before"),
+afterimg=$("#afterimg"),after=$("#after"),bar=$("#bar"),busy=$("#busy"),err=$("#err"),
+status=$("#status"),emptyMsg=$("#emptyMsg"),thumb=$("#thumb"),dl=$("#dl"),generate=$("#generate");
+let srMode="off",fit=true,dispScale=1,queue=[],selected=null,nextId=1,epoch=0,running=false,stopRequested=false;
+let position=50;
+const MEMORY_LIMIT=512*1024*1024,FILE_LIMIT=40*1024*1024;
+const current=()=>queue.find(x=>x.id===selected);
+const fail=m=>{err.textContent=m;err.classList.add("on");};
+const clearErr=()=>{err.textContent="";err.classList.remove("on");};
+function settings(){
+const s={};
+for(const [key,el] of Object.entries(controls))s[key]=bools.has(key)?el.checked:+el.value;
+s.show_mask=s.show_mask&&s.fine_enabled;s.sr_mode=srMode;return s;
 }
-function updStatus(){
-  const iw=before.naturalWidth,ih=before.naturalHeight;
-  if(!iw){status.textContent="";return;}
-  let s=`${iw}×${ih}  ${(iw*ih/1e6).toFixed(2)}MP  ${t("dispScale")} ${Math.round(dispScale*100)}%`;
-  if(outW&&outH&&(outW!==iw||outH!==ih))s+=`  → ${outW}×${outH}`;
-  if(lastMs!=null)s+=`  ${lastMs}ms`+(lastCached?`  ${t("cached")}`:"");
-  status.textContent=s;
+function validSettings(raw){
+if(!raw||typeof raw!=="object")return null;
+const s={};
+for(const [key,el] of Object.entries(controls)){
+const v=raw[key];
+if(bools.has(key)){if(typeof v!=="boolean")return null;}
+else if(typeof v!=="number"||!Number.isFinite(v)||v<+el.min||v>+el.max)return null;
+s[key]=v;
 }
-
-/* Capping the scale at 1 means images only shrink. Enlarging would just magnify the
-   very defects being judged. The canvas is a fixed-height flex item, so its own client
-   size is the available area. */
-function layout(){
-  const iw=before.naturalWidth,ih=before.naturalHeight;
-  if(!iw)return;
-  wrap.className=fit?"fit":"act";
-  let w=iw,h=ih;
-  if(fit){
-    const pad=28;
-    const s=Math.min(1,(wrap.clientWidth-pad)/iw,(wrap.clientHeight-pad)/ih);
-    w=Math.max(1,Math.round(iw*s));h=Math.max(1,Math.round(ih*s));
-  }
-  dispScale=w/iw;
-  cmp.style.width=w+"px";cmp.style.height=h+"px";
-  updStatus();
+if(!["off","1x","2x"].includes(raw.sr_mode))return null;
+s.sr_mode=raw.sr_mode;return s;
 }
-// ResizeObserver catches more than window.resize: an error bar appearing, the panel
-// collapsing, or a narrow layout stacking all resize the canvas without a window event.
-new ResizeObserver(()=>layout()).observe(wrap);
-window.addEventListener("resize",layout);
-before.addEventListener("load",()=>{
-  thumb.classList.add("on");$("#tImg").src=srcData;
-  $("#tName").textContent=fname||"—";
-  $("#tDim").textContent=`${before.naturalWidth}×${before.naturalHeight}`;
-  layout();
-});
-$("#seg").querySelectorAll("button").forEach(b=>b.onclick=()=>{
-  fit=b.dataset.fit==="1";
-  $("#seg").querySelectorAll("button").forEach(x=>x.classList.toggle("sel",x===b));
-  layout();
-});
+const signature=s=>JSON.stringify(s);
+function dirty(item){return !item.result||item.result.signature!==signature(settings());}
+function applySettings(s){
+for(const [key,el] of Object.entries(controls)){if(bools.has(key))el.checked=s[key];else el.value=s[key];}
+srMode=s.sr_mode;refreshControls();renderQueue();renderStatus();
+}
+function refreshControls(){
+const ids={alpha:"aval",micro:"microVal",spots:"spotsVal",preserve:"preserveVal",detail:"detailVal",
+cas:"casVal",grain:"grainVal",sr_blend:"srBlendVal",chroma:"chromaVal",deband:"debandVal"};
+for(const [key,id] of Object.entries(ids)){
+const el=controls[key];$("#"+id).textContent=(+el.value).toFixed(key==="grain"?3:2);
+el.style.setProperty("--fill",((+el.value-+el.min)/(+el.max-+el.min)*100)+"%");
+}
+controls.spots.disabled=controls.preserve.disabled=controls.show_mask.disabled=!controls.fine_enabled.checked;
+$("#presets").querySelectorAll("button").forEach(b=>b.classList.toggle("sel",+b.dataset.a===+controls.alpha.value));
+$("#srMode").querySelectorAll("button").forEach(b=>b.classList.toggle("sel",b.dataset.sr===srMode));
+}
+for(const [key,el] of Object.entries(controls)){
+el.oninput=()=>{refreshControls();renderQueue();renderStatus();};
+if(el.type==="range"){
+const caption=el.previousElementSibling;
+if(caption){caption.id=caption.id||"label-"+el.id;el.setAttribute("aria-labelledby",caption.id);}
+}
+}
 $("#srMode").querySelectorAll("button").forEach(b=>b.onclick=()=>{
-  srMode=b.dataset.sr;
-  $("#srMode").querySelectorAll("button").forEach(x=>x.classList.toggle("sel",x===b));
-  run();
+srMode=b.dataset.sr;refreshControls();renderQueue();renderStatus();
 });
-
-function loadFile(f){
-  if(!f||!f.type.startsWith("image/"))return fail(t("errType"));
-  clearErr();fname=f.name||"";
-  const r=new FileReader();
-  r.onload=()=>{srcData=r.result;key=null;lastMs=null;
-    before.src=srcData;afterimg.src=srcData;
-    emptyMsg.style.display="none";cmp.style.display="";
-    cmp.classList.remove("reveal");requestAnimationFrame(()=>cmp.classList.add("reveal"));
-    setPos(50);run();};
-  r.onerror=()=>fail(t("errRead"));
-  r.readAsDataURL(f);
+function itemState(item){
+if(item.state==="working")return t("working");if(item.error)return t("error");
+return item.result?(dirty(item)?t("changed"):t("ready")):t("waiting");
+}
+function renderQueue(){
+const list=$("#queue");list.replaceChildren();list.setAttribute("aria-label",t("queue"));
+for(const item of queue){
+const row=document.createElement("div");row.className="queue-row"+(item.id===selected?" selected":"");
+const pick=document.createElement("button");pick.className="queue-pick";pick.setAttribute("aria-pressed",item.id===selected);
+const name=document.createElement("span");name.textContent=item.file.name;
+const sub=document.createElement("small");sub.textContent=itemState(item);
+pick.append(name,sub);pick.title=item.error||item.file.name;pick.onclick=()=>selectItem(item.id);
+const remove=document.createElement("button");remove.className="queue-remove";remove.textContent="×";
+remove.setAttribute("aria-label",t("remove")+": "+item.file.name);remove.onclick=()=>removeItem(item.id);
+row.append(pick,remove);list.append(row);
+}
+generate.disabled=running||!queue.length||!queue.some(x=>dirty(x)||x.error);
+$("#reset").disabled=!queue.length;
+$("#stop").hidden=!running;$("#stop").disabled=stopRequested;$("#stop").textContent=t(stopRequested?"stopping":"stop");
+const ready=queue.filter(x=>x.result&&!dirty(x)&&!x.error).length;
+$("#queueStatus").textContent=queue.length?t("queue")+": "+ready+"/"+queue.length+" · "+queue.filter(x=>x.error).length+" "+t("error").toLowerCase():"";
+dl.disabled=!current()?.result;
+}
+function renderStatus(){
+const item=current();if(!item){status.textContent="";return;}
+let text=item.file.name;
+if(before.naturalWidth)text+=" · "+before.naturalWidth+"×"+before.naturalHeight+" · "+t("dispScale")+" "+Math.round(dispScale*100)+"%";
+if(item.result)text+=" → "+item.result.w+"×"+item.result.h+" · "+item.result.ms+"ms · α "+item.result.settings.alpha;
+text+=" · "+itemState(item);status.textContent=text;
+}
+function layout(){
+if(!current()||!before.naturalWidth)return;
+const item=current(),iw=item.result?.w||before.naturalWidth,ih=item.result?.h||before.naturalHeight;
+wrap.className=fit?"fit":"act";const style=getComputedStyle(wrap);
+const padX=parseFloat(style.paddingLeft)+parseFloat(style.paddingRight),padY=parseFloat(style.paddingTop)+parseFloat(style.paddingBottom);
+const scale=fit?Math.max(.001,Math.min(1,(wrap.clientWidth-padX)/iw,(wrap.clientHeight-padY)/ih)):1;
+dispScale=scale;cmp.style.width=Math.round(iw*scale)+"px";cmp.style.height=Math.round(ih*scale)+"px";renderStatus();
+}
+new ResizeObserver(layout).observe(wrap);
+before.onload=()=>{if(current()){$("#tDim").textContent=before.naturalWidth+"×"+before.naturalHeight;layout();}};
+afterimg.onload=layout;
+function showSelected(){
+const item=current();
+if(!item){
+before.removeAttribute("src");afterimg.removeAttribute("src");$("#tImg").removeAttribute("src");
+cmp.style.display="none";emptyMsg.style.display="";thumb.classList.remove("on");busy.classList.remove("on");
+renderQueue();renderStatus();return;
+}
+if(before.getAttribute("src")!==item.url)before.src=item.url;
+afterimg.src=item.result?.preview||item.result?.url||item.url;
+$("#tImg").src=item.url;$("#tName").textContent=item.file.name;thumb.classList.add("on");
+cmp.style.display="";emptyMsg.style.display="none";after.hidden=!item.result;bar.hidden=!item.result;
+$(".tag.r").hidden=!item.result;busy.classList.toggle("on",item.state==="working");
+if(item.error)fail(item.error);else clearErr();renderQueue();layout();
+}
+function selectItem(id){selected=id;setPos(50);showSelected();}
+function releaseResult(result){
+if(!result)return;URL.revokeObjectURL(result.url);if(result.preview)URL.revokeObjectURL(result.preview);
+}
+function removeItem(id){
+const item=queue.find(x=>x.id===id);if(!item)return;
+URL.revokeObjectURL(item.url);releaseResult(item.result);queue=queue.filter(x=>x!==item);
+if(selected===id)selected=queue[0]?.id??null;showSelected();
+}
+function addFiles(files){
+const errors=[];
+for(const f of Array.from(files||[])){
+if(!f||!(/\.(png|jpe?g|webp|bmp)$/i.test(f.name)||["image/png","image/jpeg","image/webp","image/bmp"].includes(f.type))){
+errors.push((f?.name||"—")+": "+t("errType"));continue;
+}
+if(queue.length>=100||f.size>FILE_LIMIT||queue.reduce((n,x)=>n+x.file.size,0)+f.size>MEMORY_LIMIT){
+errors.push(t("limits"));break;
+}
+queue.push({id:nextId++,file:f,url:URL.createObjectURL(f),state:"waiting",error:null,result:null});
+}
+if(!current()&&queue.length)selected=queue[0].id;showSelected();if(errors.length)fail(errors.join(" · "));
 }
 drop.onclick=()=>file.click();
-thumb.onclick=()=>file.click();
-file.onchange=e=>{loadFile(e.target.files[0]);file.value="";};
-
-/* Drops are accepted anywhere in the window -- nobody should have to aim at a small
-   box. Track an enter count rather than a boolean: dragleave also fires when moving
-   between child elements, and a boolean would make the highlight flicker. */
+drop.onkeydown=e=>{if(e.target===drop&&["Enter"," "].includes(e.key)){e.preventDefault();file.click();}};
+file.onclick=e=>e.stopPropagation();
+file.onchange=()=>{addFiles(file.files);file.value="";};
 const hasFiles=e=>Array.from(e.dataTransfer?.types||[]).includes("Files");
 let dragDepth=0;
-const setDragging=on=>document.body.classList.toggle("dragging",on);
-document.addEventListener("dragenter",e=>{
-  if(!hasFiles(e))return; e.preventDefault(); dragDepth++; setDragging(true);});
-document.addEventListener("dragover",e=>{
-  if(hasFiles(e))e.preventDefault();});      // without this, drop never fires
-document.addEventListener("dragleave",e=>{
-  if(!hasFiles(e))return; dragDepth=Math.max(0,dragDepth-1); if(!dragDepth)setDragging(false);});
-document.addEventListener("drop",e=>{
-  if(!hasFiles(e))return;
-  e.preventDefault(); dragDepth=0; setDragging(false);
-  loadFile(e.dataTransfer.files[0]);});
+document.addEventListener("dragenter",e=>{if(hasFiles(e)){e.preventDefault();dragDepth++;document.body.classList.add("dragging");}});
+document.addEventListener("dragover",e=>{if(hasFiles(e))e.preventDefault();});
+document.addEventListener("dragleave",e=>{if(hasFiles(e)){e.preventDefault();dragDepth=Math.max(0,dragDepth-1);if(!dragDepth)document.body.classList.remove("dragging");}});
+document.addEventListener("drop",e=>{if(hasFiles(e)){e.preventDefault();dragDepth=0;document.body.classList.remove("dragging");addFiles(e.dataTransfer.files);}});
 document.addEventListener("paste",e=>{
-  for(const it of (e.clipboardData||{}).items||[])
-    if(it.type.startsWith("image/")){loadFile(it.getAsFile());return;}
+const files=Array.from(e.clipboardData?.items||[]).filter(x=>x.kind==="file"&&x.type.startsWith("image/")).map(x=>x.getAsFile());
+if(files.length){e.preventDefault();addFiles(files);}
 });
-
-const setPos=p=>{p=Math.max(0,Math.min(100,p));
-  after.style.clipPath=`inset(0 0 0 ${p}%)`;bar.style.left=p+"%";};
-const at=e=>{const r=cmp.getBoundingClientRect();return (e.clientX-r.left)/r.width*100;};
+function setPos(p){
+position=Math.max(0,Math.min(100,p));after.style.clipPath="inset(0 0 0 "+position+"%)";
+bar.style.left=position+"%";bar.setAttribute("aria-valuenow",Math.round(position));
+}
 let drag=false;
-cmp.addEventListener("pointerdown",e=>{
-  e.preventDefault();                 // stop the browser's own image drag
-  drag=true;try{cmp.setPointerCapture(e.pointerId);}catch(_){}
-  setPos(at(e));});
-cmp.addEventListener("pointermove",e=>{if(drag)setPos(at(e));});
-// Missing either cancel or lostpointercapture leaves the divider stuck to the cursor
-["pointerup","pointercancel","lostpointercapture"].forEach(k=>
-  cmp.addEventListener(k,()=>{drag=false;}));
-cmp.addEventListener("dragstart",e=>e.preventDefault());
-
-function onAlpha(){
-  morphValue(aval,(+slider.value).toFixed(2));rangeFill(slider);markPresets();
-  clearTimeout(slider._t);slider._t=setTimeout(run,240);   // debounce while dragging
+const at=e=>{const r=cmp.getBoundingClientRect();return (e.clientX-r.left)/r.width*100;};
+cmp.onpointerdown=e=>{if(!current()?.result)return;e.preventDefault();drag=true;cmp.setPointerCapture(e.pointerId);setPos(at(e));};
+cmp.onpointermove=e=>{if(drag)setPos(at(e));};
+["pointerup","pointercancel","lostpointercapture"].forEach(k=>cmp.addEventListener(k,()=>drag=false));
+bar.onkeydown=e=>{
+if(["ArrowLeft","ArrowRight","Home","End"].includes(e.key)){
+e.preventDefault();setPos(e.key==="Home"?0:e.key==="End"?100:position+(e.key==="ArrowLeft"?-5:5));
 }
-slider.oninput=onAlpha;
-function onRestore(){
-  morphValue($("#microVal"),(+micro.value).toFixed(2));
-  morphValue($("#detailVal"),(+detail.value).toFixed(2));
-  morphValue($("#casVal"),(+cas.value).toFixed(2));
-  morphValue($("#grainVal"),(+grain.value).toFixed(3));
-  morphValue($("#srBlendVal"),(+srBlend.value).toFixed(2));
-  morphValue($("#spotsVal"),(+spots.value).toFixed(2));
-  morphValue($("#preserveVal"),(+preserve.value).toFixed(2));
-  morphValue($("#chromaVal"),(+chroma.value).toFixed(2));
-  morphValue($("#debandVal"),(+deband.value).toFixed(2));
-  [micro,detail,cas,grain,srBlend,spots,preserve,chroma,deband].forEach(rangeFill);
-  spots.disabled=preserve.disabled=showMask.disabled=!fineEnabled.checked;
-  clearTimeout(detail._t);detail._t=setTimeout(run,240);
+};
+$("#seg").querySelectorAll("button").forEach(b=>b.onclick=()=>{
+fit=b.dataset.fit==="1";$("#seg").querySelectorAll("button").forEach(x=>x.classList.toggle("sel",x===b));layout();
+});
+function dataURL(f){return new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(r.result);
+r.onerror=()=>reject(new Error(t("errRead")));r.onabort=()=>reject(new Error(t("errRead")));r.readAsDataURL(f);});}
+function checkImage(url){return new Promise((resolve,reject)=>{
+const im=new Image();im.onload=()=>resolve();im.onerror=()=>reject(new Error(t("noPreview")));im.src=url;
+});}
+function imageBlob(data){
+if(typeof data!=="string"||!data.startsWith("data:image/png;base64,"))throw new Error("Invalid PNG response");
+const bytes=atob(data.split(",")[1]),arr=new Uint8Array(bytes.length);
+for(let i=0;i<bytes.length;i++)arr[i]=bytes.charCodeAt(i);return new Blob([arr],{type:"image/png"});
 }
-[micro,detail,cas,grain,srBlend,spots,preserve,fineEnabled,showMask,chroma,deband,dither].forEach(x=>x.oninput=onRestore);
-
-async function run(){
-  if(!srcData)return;
-  if(pending){rerun=true;return;}
-  pending=true;const my=++seq;busy.classList.add("on");clearErr();
-  try{
-    const r=await fetch("/api/process",{method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({image:srcData,alpha:+slider.value,key,
-                           micro:+micro.value,detail:+detail.value,cas:+cas.value,grain:+grain.value,
-                           fine_enabled:fineEnabled.checked,spots:+spots.value,preserve:+preserve.value,
-                           show_mask:showMask.checked&&fineEnabled.checked,
-                           chroma:+chroma.value,deband:+deband.value,dither:dither.checked,
-                           sr_mode:srMode,sr_blend:+srBlend.value})});
-    const j=await r.json();
-    if(!r.ok||j.error)throw new Error(j.error||("HTTP "+r.status));
-    key=j.key;outData=j.result;afterimg.src=j.preview||outData;
-    lastMs=j.ms;lastCached=j.cached;outW=j.w;outH=j.h;
-    dl.disabled=false;dlcmp.disabled=!!j.preview;updStatus();
-  }catch(e){fail(t("errPrefix")+e.message);}
-  finally{
-    busy.classList.remove("on");pending=false;
-    if(rerun){rerun=false;run();}
-  }
+async function runQueue(){
+if(running)return;
+const config=settings(),sig=signature(config),batch=queue.filter(x=>!x.result||x.result.signature!==sig||x.error);
+if(!batch.length)return;
+running=true;stopRequested=false;const myEpoch=epoch;clearErr();renderQueue();
+try{
+for(const item of batch){
+if(stopRequested||epoch!==myEpoch)break;if(!queue.includes(item))continue;
+item.state="working";item.error=null;showSelected();let controller=null,timer=null;
+try{
+await checkImage(item.url);const data=await dataURL(item.file);
+if(epoch!==myEpoch||!queue.includes(item))continue;
+controller=new AbortController();timer=setTimeout(()=>controller.abort(),600000);
+let response;
+try{response=await fetch("/api/process",{method:"POST",headers:{"Content-Type":"application/json"},
+body:JSON.stringify({image:data,...config}),signal:controller.signal});}
+catch(e){stopRequested=true;throw new Error(e.name==="AbortError"?t("timeout"):t("network"));}
+const j=await response.json();if(!response.ok||j.error)throw new Error(j.error||"HTTP "+response.status);
+if(epoch!==myEpoch||!queue.includes(item))continue;
+const blob=imageBlob(j.result),preview=j.preview?imageBlob(j.preview):null;
+const used=queue.reduce((n,x)=>n+(x===item?0:x.result?.bytes||0),0);
+if(used+blob.size+(preview?.size||0)>MEMORY_LIMIT){stopRequested=true;throw new Error(t("resultLimit"));}
+const result={url:URL.createObjectURL(blob),preview:preview?URL.createObjectURL(preview):null,
+bytes:blob.size+(preview?.size||0),settings:config,signature:sig,w:j.w,h:j.h,ms:j.ms};
+releaseResult(item.result);item.result=result;item.state="ready";item.error=null;
+}catch(e){
+if(e.name==="AbortError"){stopRequested=true;e=new Error(t("timeout"));}
+if(epoch===myEpoch&&queue.includes(item)){item.error=e.message;item.state="error";}
 }
-const baseName=()=>fname.replace(/\.[^.]+$/,"")||"image";
-const saveBlobUrl=(href,name,revoke)=>{
-  const a=document.createElement("a");a.href=href;a.download=name;a.click();
-  if(revoke)setTimeout(()=>URL.revokeObjectURL(href),1000);
+finally{clearTimeout(timer);if(item.state==="working")item.state="waiting";if(epoch===myEpoch)showSelected();}
+}
+}finally{running=false;stopRequested=false;showSelected();}
+}
+generate.onclick=runQueue;
+$("#stop").onclick=()=>{stopRequested=true;renderQueue();};
+$("#reset").onclick=()=>{
+if(queue.some(x=>x.result)&&!confirm(t("clearConfirm")))return;
+epoch++;stopRequested=true;queue.forEach(x=>{URL.revokeObjectURL(x.url);releaseResult(x.result);});
+queue=[];selected=null;file.value="";clearErr();showSelected();
 };
 dl.onclick=()=>{
-  if(!outData)return;
-  const fx=(+micro.value||+detail.value||+cas.value||+grain.value)?"_fx":"";
-  const sr=srMode==="off"?"":`_sr${srMode}`;
-  const fine=fineEnabled.checked?`_fine_m${micro.value}_s${spots.value}_p${preserve.value}`:"_legacy";
-  const color=(+chroma.value||+deband.value)?`_c${chroma.value}_b${deband.value}_d${+dither.checked}`:"";
-  saveBlobUrl(outData,`${baseName()}_clean_a${(+slider.value).toFixed(2)}${fine}${fx}${sr}${color}.png`,false);
+const item=current();if(!item?.result)return;
+const s=item.result.settings,stem=(item.file.name.replace(/\.[^.]+$/,"")||"image").slice(0,80);
+const name=stem+"_clean_a"+s.alpha.toFixed(2)+"_m"+s.micro+"_s"+s.spots+"_p"+s.preserve+"_fine"+(+s.fine_enabled)+
+"_detail"+s.detail+"_cas"+s.cas+"_g"+s.grain+"_c"+s.chroma+"_b"+s.deband+"_d"+(+s.dither)+"_sr"+s.sr_mode+"_blend"+s.sr_blend+".png";
+const a=document.createElement("a");a.href=item.result.url;a.download=name;document.body.append(a);a.click();a.remove();
 };
-/* Compose the pair at full resolution, not at the on-screen size: the point of the
-   export is to inspect detail, and exporting the scaled view would throw that away.
-   Same layout as modeling.py --side-by-side, so the two can be viewed together. */
-dlcmp.onclick=()=>{
-  if(!outData||!before.naturalWidth)return;
-  const iw=afterimg.naturalWidth||before.naturalWidth;
-  const ih=afterimg.naturalHeight||before.naturalHeight,gap=6;
-  try{
-    const c=document.createElement("canvas");
-    c.width=iw*2+gap;c.height=ih;
-    const x=c.getContext("2d");
-    if(!x)throw new Error("canvas 2d unavailable");
-    x.fillStyle="#fff";x.fillRect(0,0,c.width,c.height);
-    x.drawImage(before,0,0,iw,ih);
-    x.drawImage(afterimg,iw+gap,0,iw,ih);
-    c.toBlob(b=>{
-      if(!b)return fail(t("errExport")+`canvas ${c.width}x${c.height}`);
-      saveBlobUrl(URL.createObjectURL(b),
-                  `${baseName()}_clean_compare_a${(+slider.value).toFixed(2)}.png`,true);
-    },"image/png");
-  }catch(e){fail(t("errExport")+e.message);}
+window.addEventListener("beforeunload",e=>{if(running||queue.some(x=>x.result)){e.preventDefault();e.returnValue="";}});
+let savedPresets=[];
+try{
+const data=JSON.parse(storage.get("stopGPTslop.presets.v1")||"[]");
+if(Array.isArray(data))savedPresets=data.slice(0,100).filter(x=>typeof x?.name==="string"&&x.name.trim()&&x.name.length<=60&&validSettings(x.settings));
+}catch{}
+function renderPresets(value=$("#userPresets").value){
+const select=$("#userPresets");select.replaceChildren(new Option(t("choosePreset"),""));
+savedPresets.forEach((p,i)=>select.add(new Option(p.name,String(i))));
+select.value=value;$("#deletePreset").disabled=select.value==="";
+}
+$("#userPresets").onchange=()=>{
+const index=$("#userPresets").value;if(index===""){$("#deletePreset").disabled=true;return;}
+const p=savedPresets[+index];$("#presetName").value=p.name;applySettings(p.settings);$("#deletePreset").disabled=false;
 };
-$("#reset").onclick=()=>{
-  srcData=outData=key=null;fname="";lastMs=outW=outH=null;fit=true;dl.disabled=dlcmp.disabled=true;
-  srMode="off";
-  micro.value="0.55";detail.value="0";cas.value="0";grain.value="0";srBlend.value="0.35";
-  spots.value="0.35";preserve.value="0.65";fineEnabled.checked=true;showMask.checked=false;
-  chroma.value=deband.value="0";dither.checked=true;
-  onRestore();
-  thumb.classList.remove("on");cmp.style.display="none";emptyMsg.style.display="";
-  $("#seg").querySelectorAll("button").forEach(x=>
-    x.classList.toggle("sel",x.dataset.fit==="1"));
-  $("#srMode").querySelectorAll("button").forEach(x=>
-    x.classList.toggle("sel",x.dataset.sr==="off"));
-  status.textContent="";clearErr();
+$("#savePreset").onclick=()=>{
+const name=$("#presetName").value.trim();if(!name)return fail(t("enterName"));
+const index=savedPresets.findIndex(x=>x.name===name);
+if(index>=0&&!confirm(t("replacePreset")))return;if(index<0&&savedPresets.length>=100)return fail(t("presetLimit"));
+const next=savedPresets.slice(),p={name,settings:settings()};if(index>=0)next[index]=p;else next.push(p);
+if(!storage.set("stopGPTslop.presets.v1",JSON.stringify(next)))return fail(t("storageError"));
+savedPresets=next;renderPresets(String(index>=0?index:next.length-1));clearErr();
 };
-paint();
+$("#deletePreset").onclick=()=>{
+const index=$("#userPresets").value;if(index===""||!confirm(t("removePreset")))return;
+const next=savedPresets.filter((_,i)=>i!==+index);
+if(!storage.set("stopGPTslop.presets.v1",JSON.stringify(next)))return fail(t("storageError"));
+savedPresets=next;renderPresets("");$("#presetName").value="";clearErr();
+};
+function paint(){
+document.documentElement.lang=lang;document.querySelectorAll("[data-i]").forEach(el=>el.textContent=t(el.dataset.i));
+$("#dropSm").innerHTML=t("dropSm");$("#lang").textContent=lang==="ru"?"EN":lang==="en"?"中":"RU";
+$("#presets").replaceChildren();
+for(const [v,key] of PRESETS){
+const b=document.createElement("button");b.dataset.a=v;b.textContent=v.toFixed(2)+" "+t(key);
+b.onclick=()=>{controls.alpha.value=v;refreshControls();renderQueue();renderStatus();};$("#presets").append(b);
+}
+refreshControls();renderPresets();renderQueue();renderStatus();
+}
+$("#lang").onclick=()=>{lang=lang==="ru"?"en":lang==="en"?"zh":"ru";storage.set("stopGPTslop.lang",lang);paint();};
+const savedTheme=storage.get("stopGPTslop.theme");
+if(["light","dark"].includes(savedTheme))document.documentElement.dataset.theme=savedTheme;
+const isDark=()=>document.documentElement.dataset.theme?document.documentElement.dataset.theme==="dark":matchMedia("(prefers-color-scheme:dark)").matches;
+const paintTheme=()=>$("#theme").textContent=isDark()?"☀":"☾";
+$("#theme").onclick=()=>{const theme=isDark()?"light":"dark";document.documentElement.dataset.theme=theme;storage.set("stopGPTslop.theme",theme);paintTheme();};
+paintTheme();paint();
 </script></body></html>
 """
 
@@ -831,9 +922,7 @@ def _encode_z(arr_u8):
     dev, dtype = STATE["device"], STATE["dtype"]
     H, W = arr_u8.shape[:2]
     x = torch.from_numpy(arr_u8.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0).to(dev)
-    ph, pw = (-H) % ALIGN, (-W) % ALIGN
-    if ph or pw:
-        x = F.pad(x, (0, pw, 0, ph), mode="reflect")
+    x = pad_to_alignment(x)
     with torch.no_grad(), _autocast_context(dev, dtype):
         z = STATE["enc"](x * 2 - 1)
         dz = STATE["R"](z)
@@ -1023,8 +1112,14 @@ def process(img_b64, alpha, key, micro=0.0, detail=0.0, cas=0.0, grain=0.0,
     grain = float(np.clip(grain, 0, 0.04))
     if sr_mode not in {"off", "1x", "2x"}:
         raise ValueError("unknown Real-ESRGAN mode")
-    raw = base64.b64decode(img_b64.split(",", 1)[-1])
-    arr = np.asarray(Image.open(io.BytesIO(raw)).convert("RGB"))
+    if not isinstance(img_b64, str) or len(img_b64) > MAX_REQUEST_BYTES:
+        raise ValueError("Invalid image payload or file too large (40 MB maximum)")
+    raw = base64.b64decode(img_b64.split(",", 1)[-1], validate=True)
+    with Image.open(io.BytesIO(raw)) as image:
+        pixels = image.width * image.height
+        if pixels > MAX_IMAGE_PIXELS or pixels * (4 if sr_mode == "2x" else 1) > MAX_OUTPUT_PIXELS:
+            raise ValueError("Image too large: maximum 24 MP input / 40 MP output")
+    arr = read_image(io.BytesIO(raw))
     # Never let a stale browser key pair another image with a cached latent.
     k = hashlib.md5(raw).hexdigest()
     t0 = time.time()
@@ -1043,6 +1138,8 @@ def process(img_b64, alpha, key, micro=0.0, detail=0.0, cas=0.0, grain=0.0,
             while len(CACHE_ORDER) > STATE["cache_n"]:
                 CACHE.pop(CACHE_ORDER.pop(0), None)
         entry = CACHE[k]
+        CACHE_ORDER.remove(k)
+        CACHE_ORDER.append(k)
         if entry["last_alpha"] != alpha:
             decoded = _decode(entry["z"], entry["dz"], alpha, entry["H"], entry["W"])
             entry.update(last_alpha=alpha, decoded=decoded)
@@ -1109,6 +1206,7 @@ def process(img_b64, alpha, key, micro=0.0, detail=0.0, cas=0.0, grain=0.0,
             preview_buf = io.BytesIO()
             marked.save(preview_buf, format="PNG", compress_level=1)
             preview = "data:image/png;base64," + base64.b64encode(preview_buf.getvalue()).decode()
+        _trim_cache()
     buf = io.BytesIO()
     # PNG avoids adding lossy compression artifacts or softness to an image whose
     # fine detail is the entire reason for using the cleaner.
@@ -1132,17 +1230,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self):
         path = self.path.split("?")[0]
-        if path == "/vendor/torph.mjs":
-            try:
-                with open(TORPH_JS, "rb") as src:
-                    return self._send(200, src.read(), "text/javascript; charset=utf-8")
-            except OSError:
-                return self._send(404, b"not found", "text/plain")
         if path not in ("/", "/index.html"):
             return self._send(404, b"not found", "text/plain")
         self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
@@ -1152,7 +1245,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, b'{"error":"not found"}', "application/json")
         try:
             n = int(self.headers.get("Content-Length", 0))
+            if n <= 0 or n > MAX_REQUEST_BYTES:
+                self.close_connection = True
+                return self._send(413, b'{"error":"Request too large or empty"}', "application/json")
             req = json.loads(self.rfile.read(n))
+            if not isinstance(req, dict):
+                raise ValueError("Expected a JSON object")
             out = process(req["image"], float(req.get("alpha", 1.0)), req.get("key"),
                           float(req.get("micro", 0.0)), float(req.get("detail", 0.0)),
                           float(req.get("cas", 0.0)),
@@ -1163,11 +1261,14 @@ class Handler(BaseHTTPRequestHandler):
                           float(req.get("deband", 0)), bool(req.get("dither", True)))
             body = json.dumps(out).encode()
         except torch.cuda.OutOfMemoryError:
+            with LOCK:
+                CACHE.clear()
+                CACHE_ORDER.clear()
             torch.cuda.empty_cache()
             return self._send(500, json.dumps({"error": "out of GPU memory"}).encode(),
                               "application/json")
         except Exception as e:
-            return self._send(500, json.dumps({"error": str(e)}).encode(), "application/json")
+            return self._send(400, json.dumps({"error": str(e)}).encode(), "application/json")
         self._send(200, body, "application/json")
 
     def log_message(self, fmt, *a):     # quieten per-request logging; keep non-2xx
@@ -1198,8 +1299,12 @@ def main():
                         "first image")
     p.add_argument("--no-browser", action="store_true")
     args = p.parse_args()
+    if args.cache_n < 1:
+        p.error("--cache-n must be at least 1")
+    if args.sr_tile < 1:
+        p.error("--sr-tile must be positive")
 
-    dtype = torch.float32 if args.fp32 else torch.bfloat16
+    dtype = torch.float32 if args.fp32 or args.device.split(":")[0] != "cuda" else torch.bfloat16
     t0 = time.time()
     print("Loading model ...", flush=True)
     vae = load_vae(args.vae, args.device)

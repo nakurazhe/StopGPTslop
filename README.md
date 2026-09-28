@@ -61,11 +61,30 @@ CPU silently in this situation, so it is worth checking once after installing.
 uv run webui.py                 # then open http://127.0.0.1:7860
 ```
 
-Drop, browse or paste an image, then drag the divider to compare before and after.
-Move the strength slider and the result updates immediately. You can download either
-the result alone or a side-by-side comparison.
+Drop, browse or paste one or more PNG/JPEG/WebP/BMP images into the queue. Adjust
+the controls, then press **Generate**. Moving sliders, changing presets or loading
+images never starts processing. Each run takes a snapshot of all settings and
+processes the current queue sequentially, without concurrent GPU inference.
+Completed images with identical settings are skipped; errors can be retried.
+**Stop after current** lets the in-flight image finish. Clearing/removing an image
+discards any late response for it; this does not interrupt an already running GPU call.
 
-The interface follows your system language (English / 简体中文) and colour theme, and
+Select a queue item to inspect it with the before/after divider. **Download PNG**
+and **Clear** are in the top-right corner. Downloads use the settings of the actual
+result, even if controls have since changed. The Web UI comparison-export button
+has been removed; CLI `--side-by-side` remains available. In 1:1 mode, upscaled
+results are displayed at their output resolution.
+
+Save, select, replace or delete named **My presets** in this browser's local storage.
+Presets persist across reloads; image files, queue and results do not. Download
+results before closing the page. Clear removes the queue, not your settings/presets.
+The browser queue accepts up to 100 files, 40 MB per file and 512 MB total source
+data; retained PNG results have a separate 512 MB limit. The API accepts up to
+24 MP input / 40 MP output. These limits are safeguards, not a guarantee against OOM.
+The server cache is LRU-limited to 512 MB of counted arrays/tensors and `--cache-n`
+entries; active processing temporarily needs additional memory. No new dependencies.
+
+The interface follows your system language (English / Русский / 简体中文) and colour theme, and
 both can be switched from the header.
 
 ### Selective fine cleanup (experimental Web UI mode)
@@ -81,7 +100,7 @@ detail. It is heuristic: fabric, pores and other real textures may still be affe
 - **Preserve micro-texture** (0.65): higher keeps more of the original fine texture;
   lower returns less texture bypassed by the VAE, only in masked areas.
 - **Show mask**: orange marks candidate processing areas. Downloaded PNGs remain
-  clean; comparison export is disabled while the mask is displayed.
+  clean, without the preview mask.
 
 Disable **Selective fine cleanup** for the previous processing mode with the same
 main strength and micro-texture setting. The new stage runs before optional SR.
@@ -141,6 +160,13 @@ uv run modeling.py -i ./in -o ./out --side-by-side
 
 Images that already have an output are skipped, so an interrupted run can simply be
 restarted. Use `--overwrite` to redo them. See `--help` for the full list of options.
+Recursive batches preserve input subdirectories and exclude the output directory
+if it is inside the input tree. Conflicting output names and
+paths that would overwrite source files are rejected before inference. Read,
+processing and save failures are reported with exit code 1; successful files remain
+available. Saves are atomic so incomplete outputs are not mistaken for completed
+files. EXIF orientation is applied in both CLI and Web UI; animated/multi-page
+inputs are rejected rather than silently processing only their first frame.
 
 ## Strength
 

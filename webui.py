@@ -42,6 +42,7 @@ sys.path.insert(0, HERE)
 from modeling import (ALIGN, build_fns, load_vae, load_refiner_model,
                       load_realesrgan_model)  # noqa: E402
 import fine_cleanup
+import color_cleanup
 
 STATE = {}
 CACHE = {}
@@ -392,6 +393,16 @@ input[type=range]:active::-webkit-slider-thumb{transform:scale(1.14)}
       </div>
 
       <div class="grp">
+        <span class="eyebrow" data-i="secColor"></span>
+        <label class="hint" for="chroma"><span data-i="chromaLabel"></span> <b class="num" id="chromaVal">0.00</b></label>
+        <input type="range" id="chroma" min="0" max="1" step="0.05" value="0">
+        <label class="hint" for="deband"><span data-i="debandLabel"></span> <b class="num" id="debandVal">0.00</b></label>
+        <input type="range" id="deband" min="0" max="1" step="0.05" value="0">
+        <label class="hint"><span data-i="ditherLabel"></span><input id="dither" type="checkbox" checked></label>
+        <p class="sm" data-i="colorHint"></p>
+      </div>
+
+      <div class="grp">
         <span class="eyebrow" data-i="secRestore"></span>
         <label class="hint"><span data-i="detailLabel"></span> <b class="num" id="detailVal">0.00</b></label>
         <input type="range" id="detail" min="0" max="1" step="0.05" value="0">
@@ -511,6 +522,22 @@ Object.assign(I18N.zh,{
   fineHint:"橙色表示处理区域。关闭后使用旧模式。PNG 不包含蒙版。"
 });
 
+Object.assign(I18N.ru,{
+  secColor:"Цвет и градиенты",chromaLabel:"Цветовая грязь",debandLabel:"Ступеньки градиентов",
+  ditherLabel:"Дизеринг градиентов",
+  colorHint:"Независимые CPU-фильтры. Начните с 0.50. Ноль отключает эффект. Дизеринг работает только со ступеньками; это не зерно. Оранжевая маска выше относится только к микротекстуре."
+});
+Object.assign(I18N.en,{
+  secColor:"Colour and gradients",chromaLabel:"Colour blotches",debandLabel:"Gradient banding",
+  ditherLabel:"Gradient dithering",
+  colorHint:"Independent CPU filters. Start at 0.50; zero disables each effect. Dithering acts only with debanding, separately from grain. The orange mask above shows micro-texture cleanup only."
+});
+Object.assign(I18N.zh,{
+  secColor:"颜色与渐变",chromaLabel:"色彩杂斑",debandLabel:"渐变色带",
+  ditherLabel:"渐变抖动",
+  colorHint:"独立的 CPU 滤镜。建议从 0.50 开始；零关闭对应效果。抖动仅在去色带时生效，与颗粒无关。上方橙色蒙版仅显示微纹理清理。"
+});
+
 const navLang=(navigator.language||"en").toLowerCase();
 let lang=navLang.startsWith("zh")?"zh":navLang.startsWith("ru")?"ru":"en";
 lang=localStorage.getItem("stopGPTslop.lang")||lang;
@@ -546,7 +573,8 @@ const drop=$("#drop"),file=$("#file"),slider=$("#a"),aval=$("#aval"),wrap=$("#wr
       busy=$("#busy"),err=$("#err"),status=$("#status"),emptyMsg=$("#emptyMsg"),
       thumb=$("#thumb"),dl=$("#dl"),dlcmp=$("#dlcmp"),
       micro=$("#micro"),detail=$("#detail"),cas=$("#cas"),grain=$("#grain"),srBlend=$("#srBlend"),
-      spots=$("#spots"),preserve=$("#preserve"),fineEnabled=$("#fineEnabled"),showMask=$("#showMask");
+      spots=$("#spots"),preserve=$("#preserve"),fineEnabled=$("#fineEnabled"),showMask=$("#showMask"),
+      chroma=$("#chroma"),deband=$("#deband"),dither=$("#dither");
 let srcData=null,key=null,outData=null,fname="",seq=0,pending=false,fit=true,dispScale=1,
     lastMs=null,lastCached=false,outW=null,outH=null,srMode="off",rerun=false;
 
@@ -712,11 +740,13 @@ function onRestore(){
   morphValue($("#srBlendVal"),(+srBlend.value).toFixed(2));
   morphValue($("#spotsVal"),(+spots.value).toFixed(2));
   morphValue($("#preserveVal"),(+preserve.value).toFixed(2));
-  [micro,detail,cas,grain,srBlend,spots,preserve].forEach(rangeFill);
+  morphValue($("#chromaVal"),(+chroma.value).toFixed(2));
+  morphValue($("#debandVal"),(+deband.value).toFixed(2));
+  [micro,detail,cas,grain,srBlend,spots,preserve,chroma,deband].forEach(rangeFill);
   spots.disabled=preserve.disabled=showMask.disabled=!fineEnabled.checked;
   clearTimeout(detail._t);detail._t=setTimeout(run,240);
 }
-[micro,detail,cas,grain,srBlend,spots,preserve,fineEnabled,showMask].forEach(x=>x.oninput=onRestore);
+[micro,detail,cas,grain,srBlend,spots,preserve,fineEnabled,showMask,chroma,deband,dither].forEach(x=>x.oninput=onRestore);
 
 async function run(){
   if(!srcData)return;
@@ -729,6 +759,7 @@ async function run(){
                            micro:+micro.value,detail:+detail.value,cas:+cas.value,grain:+grain.value,
                            fine_enabled:fineEnabled.checked,spots:+spots.value,preserve:+preserve.value,
                            show_mask:showMask.checked&&fineEnabled.checked,
+                           chroma:+chroma.value,deband:+deband.value,dither:dither.checked,
                            sr_mode:srMode,sr_blend:+srBlend.value})});
     const j=await r.json();
     if(!r.ok||j.error)throw new Error(j.error||("HTTP "+r.status));
@@ -751,7 +782,8 @@ dl.onclick=()=>{
   const fx=(+micro.value||+detail.value||+cas.value||+grain.value)?"_fx":"";
   const sr=srMode==="off"?"":`_sr${srMode}`;
   const fine=fineEnabled.checked?`_fine_m${micro.value}_s${spots.value}_p${preserve.value}`:"_legacy";
-  saveBlobUrl(outData,`${baseName()}_clean_a${(+slider.value).toFixed(2)}${fine}${fx}${sr}.png`,false);
+  const color=(+chroma.value||+deband.value)?`_c${chroma.value}_b${deband.value}_d${+dither.checked}`:"";
+  saveBlobUrl(outData,`${baseName()}_clean_a${(+slider.value).toFixed(2)}${fine}${fx}${sr}${color}.png`,false);
 };
 /* Compose the pair at full resolution, not at the on-screen size: the point of the
    export is to inspect detail, and exporting the scaled view would throw that away.
@@ -780,6 +812,7 @@ $("#reset").onclick=()=>{
   srMode="off";
   micro.value="0.55";detail.value="0";cas.value="0";grain.value="0";srBlend.value="0.35";
   spots.value="0.35";preserve.value="0.65";fineEnabled.checked=true;showMask.checked=false;
+  chroma.value=deband.value="0";dither.checked=true;
   onRestore();
   thumb.classList.remove("on");cmp.style.display="none";emptyMsg.style.display="";
   $("#seg").querySelectorAll("button").forEach(x=>
@@ -927,7 +960,7 @@ def _suppress_micro_pattern(arr_u8, amount):
     return np.clip(output * 255.0, 0, 255).round().astype(np.uint8)
 
 
-def _frequency_and_cas(arr_u8, detail, cas, protection=None):
+def _frequency_and_cas(arr_u8, detail, cas, protection=None, return_float=False):
     """Luminance frequency split followed by contrast-adaptive sharpening."""
     detail, cas = float(np.clip(detail, 0, 1)), float(np.clip(cas, 0, 1))
     image = arr_u8.astype(np.float32) / 255.0
@@ -960,7 +993,7 @@ def _frequency_and_cas(arr_u8, detail, cas, protection=None):
         image = np.clip(image + cas * (sharpened - image), 0, 1)
     if protection is not None:
         image = original + (image - original) * (1 - np.clip(protection, 0, 1))[..., None]
-    return (image * 255).round().astype(np.uint8)
+    return image if return_float else (image * 255).round().astype(np.uint8)
 
 
 def _add_grain(arr_u8, amount, seed):
@@ -979,13 +1012,15 @@ def _add_grain(arr_u8, amount, seed):
 
 def process(img_b64, alpha, key, micro=0.0, detail=0.0, cas=0.0, grain=0.0,
             sr_mode="off", sr_blend=0.35, fine_enabled=False, spots=0.35,
-            preserve=0.65, show_mask=False):
-    values = (alpha, micro, detail, cas, grain, sr_blend, spots, preserve)
+            preserve=0.65, show_mask=False, chroma=0.0, deband=0.0, dither=True):
+    values = (alpha, micro, detail, cas, grain, sr_blend, spots, preserve, chroma, deband)
     if not all(np.isfinite(v) for v in values):
         raise ValueError("Cleanup settings must be finite numbers")
     alpha = float(np.clip(alpha, 0, 2))
     micro, detail, cas, sr_blend, spots, preserve = (
         float(np.clip(v, 0, 1)) for v in (micro, detail, cas, sr_blend, spots, preserve))
+    chroma, deband = (float(np.clip(v, 0, 1)) for v in (chroma, deband))
+    grain = float(np.clip(grain, 0, 0.04))
     if sr_mode not in {"off", "1x", "2x"}:
         raise ValueError("unknown Real-ESRGAN mode")
     raw = base64.b64decode(img_b64.split(",", 1)[-1])
@@ -1046,8 +1081,24 @@ def process(img_b64, alpha, key, micro=0.0, detail=0.0, cas=0.0, grain=0.0,
             if protection.shape != out.shape[:2]:
                 protection = np.asarray(Image.fromarray(protection).resize(
                     (out.shape[1], out.shape[0]), Image.Resampling.BILINEAR))
-        out = _frequency_and_cas(out, detail, cas, protection)
-        out = _add_grain(out, grain, int(k[:16], 16))
+        if chroma > 0 or deband > 0:
+            # Finish AFTER sharpening/SR so those stages cannot restore bands.
+            # Keep this entire new stage float; upstream legacy stages remain
+            # unchanged so disabling both controls restores the approved output.
+            finish_key = (stage_key, detail, cas, chroma, deband)
+            if entry.get("finish_key") != finish_key:
+                out = _frequency_and_cas(out, detail, cas, protection, return_float=True)
+                out = color_cleanup.clean_chroma(out, chroma)
+                out, dither_mask = color_cleanup.clean_gradients(out, deband)
+                entry.update(finish_key=finish_key, finished=out, dither_mask=dither_mask)
+            out = color_cleanup.finish(entry["finished"], grain, int(k[:16], 16),
+                                       entry["dither_mask"] if dither and deband > 0 else None)
+        else:
+            entry.pop("finished", None)
+            entry.pop("dither_mask", None)
+            entry.pop("finish_key", None)
+            out = _frequency_and_cas(out, detail, cas, protection)
+            out = _add_grain(out, grain, int(k[:16], 16))
         preview = None
         if show_mask and fine_enabled:
             display_masks = {name: np.maximum(entry["masks"][name], entry["cleanup_masks"][name])
@@ -1108,7 +1159,8 @@ class Handler(BaseHTTPRequestHandler):
                           float(req.get("grain", 0.0)), req.get("sr_mode", "off"),
                           float(req.get("sr_blend", 0.35)), bool(req.get("fine_enabled", False)),
                           float(req.get("spots", 0.35)), float(req.get("preserve", 0.65)),
-                          bool(req.get("show_mask", False)))
+                          bool(req.get("show_mask", False)), float(req.get("chroma", 0)),
+                          float(req.get("deband", 0)), bool(req.get("dither", True)))
             body = json.dumps(out).encode()
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()

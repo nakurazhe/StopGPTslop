@@ -92,6 +92,39 @@ the same residual texture again. Grain remains a separate, intentional effect;
 keep it at zero when evaluating fine-artifact removal.
 The batch CLI is unchanged. Validate the tradeoff on 1:1 crops of your own images.
 
+### Colour and gradients (experimental Web UI finishing)
+
+Two independent CPU controls are **off by default (0)**, preserving the previous
+output. Start at **0.50** on an affected image and inspect at 1:1 with grain at zero.
+
+- **Colour blotches**: full-resolution, colour/brightness-aware neighbourhood
+  smoothing of opponent colour channels, retaining luma. Small false-colour spots
+  can be reduced; broad wrong lighting, strong fringes and colour moire may remain.
+  Real low-contrast colour detail can also be affected.
+- **Gradient banding**: bounded multiscale smoothing of quiet, low-contrast areas,
+  with RGB edge/texture and full-window variance protection. It targets tonal
+  steps, not jagged diagonal object edges. Strong bands can remain; weak genuine
+  contours may soften at high strength.
+- **Gradient dithering**: enabled by default, but active only with debanding and
+  only where it changes pixels. Adds stable monochrome noise of at most half an
+  8-bit code step before rounding, separately from artistic grain.
+
+These controls work independently of selective fine cleanup. The orange preview
+mask still describes **micro-texture cleanup only**, not colour or gradient masks.
+The finishing stage runs after optional SR and sharpening, using float32 through
+colour cleanup, debanding and grain until one final 8-bit PNG quantization. Earlier
+VAE-composition/fine-cleanup/SR stages retain their existing 8-bit boundaries;
+this is not end-to-end high-bit-depth processing or 16-bit export.
+
+No additional weights, dependencies or GPU inference are required. Changing these
+controls reuses the cached upstream result, including SR. CPU time and RAM grow
+with resolution; no universal speed claim is made. The CLI remains unchanged.
+The implementation is independent; algorithmic references are
+[FFmpeg chromanr](https://github.com/FFmpeg/FFmpeg/blob/master/libavfilter/vf_chromanr.c)
+and [neo_f3kdb](https://github.com/HomeOfAviSynthPlusEvolution/neo_f3kdb), not bundled
+plugins or copied source. Validate on your own generated images before relying on
+the heuristics for final output.
+
 ## Command line
 
 ```bash

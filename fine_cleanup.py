@@ -153,3 +153,80 @@ def overlay(image_u8, masks, micro, spots, preserve):
     tint = np.array([255, 96, 24], dtype=np.float32)
     alpha = (0.75 * mask)[..., None]
     return (image_u8 * (1 - alpha) + tint * alpha).round().astype(np.uint8)
+
+
+def structure_guide(source_u8):
+    """Source-scale luma bands, not an object/colour/density classifier.
+
+    Coherence in small neighborhoods admits crossing contours without treating
+    all high-frequency energy as detail. A coarser guide rejects pixel noise.
+    This is still a heuristic: structured artifacts can resemble real lines.
+    """
+    luma = source_u8.astype(np.float32) @ LUMA / 255
+    small, broad = box_mean(luma, 1), box_mean(luma, 3)
+    gx = (_shift(small, 0, 1) - _shift(small, 0, -1)) * 0.5
+    gy = (_shift(small, 1, 0) - _shift(small, -1, 0)) * 0.5
+    xx, yy, xy = (box_mean(v, 1) for v in (gx * gx, gy * gy, gx * gy))
+    coherence = np.sqrt((xx - yy) ** 2 + 4 * xy * xy) / (xx + yy + 1e-8)
+    confidence = smoothstep(0.35, 0.80, coherence)
+    confidence *= smoothstep(0.002, 0.012, np.sqrt(xx + yy))
+    # A monotonic ramp/step is not a thin ridge. Do not undo debanding just
+    # because a band boundary also has a coherent gradient.
+    ridge = np.zeros_like(luma)
+    for dy, dx in ((0, 2), (2, 0), (2, 2), (2, -2)):
+        a, b = small - _shift(small, dy, dx), small - _shift(small, -dy, -dx)
+        ridge = np.maximum(ridge, np.maximum(np.minimum(a, b), np.minimum(-a, -b)))
+    confidence *= smoothstep(0.001, 0.008, box_mean(ridge, 2))
+    # Require supporting detail at the next scale, not density. Fine-only
+    # irregular clusters are precisely what the existing cleaner targets.
+    fine, medium = luma - small, small - broad
+    scale_support = np.sqrt(box_mean(medium * medium, 3) /
+                            (box_mean(fine * fine, 3) + 1e-8))
+    confidence *= smoothstep(0.55, 0.90, scale_support)
+    # Do not rescue isolated impulses or one-pixel checkerboards based on their
+    # energy alone. Their fine detail has no supporting longer-scale structure.
+    confidence = box_mean(confidence, 1)
+    return (fine, medium, confidence)
+
+
+def protect_structure(image, guide, amount):
+    """Restore only correlated, attenuated source luma bands, after cleanup/SR.
+
+    No chroma residual or low-frequency source image is blended back. Evaluate
+    at source resolution even for 2x output; never invent higher-resolution detail.
+    """
+    if amount <= 0:
+        return image
+    fine, medium, confidence = guide
+    h, w = fine.shape
+    luma = image @ LUMA
+    if luma.shape != fine.shape:
+        luma = np.asarray(Image.fromarray(luma).resize((w, h), Image.Resampling.BOX))
+    small = box_mean(luma, 1)
+    bands = (luma - small, small - box_mean(luma, 3))
+    correction = np.zeros_like(fine)
+    for source, current in zip((fine, medium), bands):
+        energy = box_mean(source * source, 3)
+        current_energy = box_mean(current * current, 3)
+        covariance = box_mean(source * current, 3)
+        correlation = covariance / np.sqrt(energy * current_energy + 1e-12)
+        gain = covariance / (energy + 1e-8)
+        # Do nothing to unchanged/amplified detail, or to replaced/displaced
+        # structure. Local correlation is evidence, not semantic certainty.
+        eligible = confidence * smoothstep(0.25, 0.75, correlation)
+        eligible *= smoothstep(0.003, 0.012, np.sqrt(energy))
+        lost = np.clip(1 - gain, 0, 0.85)
+        candidate = source * lost
+        # Never cross the original band or add a correction against its residual.
+        residual = source - current
+        candidate = np.sign(candidate) * np.minimum(np.abs(candidate), np.abs(residual))
+        candidate *= (candidate * residual > 0)
+        correction += candidate * eligible
+    correction *= float(np.clip(amount, 0, 1))
+    if image.shape[:2] != fine.shape:
+        correction = np.asarray(Image.fromarray(correction).resize(
+            (image.shape[1], image.shape[0]), Image.Resampling.BILINEAR))
+    # Equal RGB increments keep channel differences (chroma) unchanged, including
+    # near gamut limits: limit the increment instead of clipping each channel.
+    correction = np.clip(correction, -np.min(image, axis=2), 1 - np.max(image, axis=2))
+    return image + correction[..., None]

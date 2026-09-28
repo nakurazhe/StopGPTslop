@@ -1,0 +1,47 @@
+[project]
+name = "stopgptslop"
+version = "1.0.0"
+description = "Remove the artifacts specific to GPT Image 2 output"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "PolyForm-Noncommercial-1.0.0"
+license-files = ["LICENSE"]
+dependencies = [
+    "torch>=2.6",
+    "diffusers>=0.39",
+    "pillow>=10.0",
+    "numpy>=1.24",
+    "accelerate>=0.30",   # diffusers uses it for faster, lower-memory model loading
+]
+
+[project.urls]
+Homepage = "https://github.com/nakurazhe/StopGPTslop"
+Repository = "https://github.com/nakurazhe/StopGPTslop"
+Issues = "https://github.com/nakurazhe/StopGPTslop/issues"
+
+[project.scripts]
+stopgptslop = "modeling:main"
+
+# PyTorch on PyPI tracks the newest CUDA runtime, which silently falls back to CPU on
+# anything but a very recent driver. Pin the CUDA 12.6 build instead: it needs only
+# driver 525 or newer and covers most machines. To use a different runtime, change the
+# URL below (cu118 / cu124 / cu128 / cu130 ...) or see the README for a CPU-only setup.
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cuda", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["modeling", "webui"]
+
+[tool.setuptools.package-data]
+"*" = ["weights/*.pt"]

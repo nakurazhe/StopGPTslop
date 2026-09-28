@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.cache/
+logs/
+node_modules/
+*.egg-info/
+build/
+dist/
+.DS_Store
+
+# uv.lock is committed on purpose: this is an application, so pinning the
+# resolved dependency set keeps installs reproducible.
+
+# Full-size source images and exports used to build the README assets. Kept out of the
+# repository because git clone has no way to skip them, and README rendering does not
+# need full resolution -- see assets/ for the published versions.
+examples/

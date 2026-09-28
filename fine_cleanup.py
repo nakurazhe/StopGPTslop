@@ -190,7 +190,7 @@ def structure_guide(source_u8):
 
 
 def protect_structure(image, guide, amount):
-    """Restore only correlated, attenuated source luma bands, after cleanup/SR.
+    """Protect correlated luma structure with cross-scale loss detection.
 
     No chroma residual or low-frequency source image is blended back. Evaluate
     at source resolution even for 2x output; never invent higher-resolution detail.
@@ -205,23 +205,25 @@ def protect_structure(image, guide, amount):
     small = box_mean(luma, 1)
     bands = (luma - small, small - box_mean(luma, 3))
     correction = np.zeros_like(fine)
+    statistics = []
+    loss = np.zeros_like(fine)
     for source, current in zip((fine, medium), bands):
         energy = box_mean(source * source, 3)
         current_energy = box_mean(current * current, 3)
         covariance = box_mean(source * current, 3)
         correlation = covariance / np.sqrt(energy * current_energy + 1e-12)
         gain = covariance / (energy + 1e-8)
-        # Do nothing to unchanged/amplified detail, or to replaced/displaced
-        # structure. Local correlation is evidence, not semantic certainty.
-        eligible = confidence * smoothstep(0.25, 0.75, correlation)
-        eligible *= smoothstep(0.003, 0.012, np.sqrt(energy))
-        lost = np.clip(1 - gain, 0, 0.85)
-        candidate = source * lost
-        # Never cross the original band or add a correction against its residual.
-        residual = source - current
-        candidate = np.sign(candidate) * np.minimum(np.abs(candidate), np.abs(residual))
-        candidate *= (candidate * residual > 0)
-        correction += candidate * eligible
+        reliable = smoothstep(0.25, 0.75, correlation)
+        reliable *= smoothstep(0.003, 0.012, np.sqrt(energy))
+        statistics.append(reliable)
+        # Detect damage across scales. Sharpening may amplify pixel edges while
+        # the actual line body is still attenuated at the adjacent scale.
+        loss = np.maximum(loss, smoothstep(0.05, 0.35, 1 - gain) * reliable)
+    for source, current, reliable in zip((fine, medium), bands, statistics):
+        # Correct the shape, not just its contrast: excessive surviving edges
+        # must also move toward the source when the line body has been lost.
+        correction += (source - current) * reliable
+    correction *= smoothstep(0.12, 0.60, confidence) * loss
     correction *= float(np.clip(amount, 0, 1))
     if image.shape[:2] != fine.shape:
         correction = np.asarray(Image.fromarray(correction).resize(

@@ -99,6 +99,11 @@ if processing smears fine lines. This is independent of Preserve micro-texture:
 it compares the source with the finished image after cleanup, SR and sharpening,
 before grain/dither. Two source-scale luminance bands are partially restored only
 where line/ridge structure survives, remains correlated and has lost contrast.
+Loss is evaluated across both scales together: stronger pixel edges after
+sharpening cannot hide a softened line body. In confirmed damaged regions,
+the source band shape is blended back, including reducing exaggerated edges,
+instead of merely adding a small contrast boost. Undamaged/amplified structure
+alone does not trigger restoration; higher strength may undo more stylization.
 It does not recognize objects, colours or "nature", nor protect an entire region
 merely because it has dense texture. Monotonic steps, flat areas, isolated dots
 and pixel checkerboards are rejected by the guide. Chroma and the broad source

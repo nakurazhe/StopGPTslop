@@ -101,6 +101,24 @@ class StructureTests(unittest.TestCase):
         out = fine.protect_structure(image, fine.structure_guide(source), 1)
         self.assertLess(np.max(np.abs(out - image)), 1 / 255)
 
+    def test_sharp_pixel_edges_cannot_hide_lost_line_bodies(self):
+        y, x = np.mgrid[:128, :160]
+        body = np.sin(.45*x + .2*y)
+        edges = np.sin(1.5*x + .2*y)
+        source = np.repeat((.45 + .08*body + .025*edges)[..., None], 3, axis=2)
+        rgb = (source * 255).round().astype(np.uint8)
+        source = rgb.astype(np.float32) / 255
+        damaged = np.repeat((.45 + .035*body + .05*edges)[..., None], 3, axis=2).astype(np.float32)
+        guide = fine.structure_guide(rgb)
+        current_fine = damaged[..., 0] - fine.box_mean(damaged[..., 0], 1)
+        region = np.s_[12:-12, 12:-12]
+        # Reproduce the actual failure: the pixel-scale band is stronger,
+        # although the wider line has lost more than half of its contrast.
+        self.assertGreater(current_fine[region].std(), guide[0][region].std())
+        out = fine.protect_structure(damaged, guide, 1)
+        self.assertLess(np.mean((out[region] - source[region]) ** 2),
+                        .8 * np.mean((damaged[region] - source[region]) ** 2))
+
 
 class StructurePipelineTests(unittest.TestCase):
     setUp = test_fine_cleanup.PipelineTests.setUp

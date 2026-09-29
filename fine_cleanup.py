@@ -22,14 +22,46 @@ def box_mean(field, radius):
         padding = [(0, 0)] * result.ndim
         padding[axis] = (radius, radius)
         padded = np.pad(result, padding, mode="edge")
-        sums = np.cumsum(padded, axis=axis, dtype=np.float64)
-        zero_shape = list(sums.shape)
-        zero_shape[axis] = 1
-        sums = np.concatenate((np.zeros(zero_shape), sums), axis=axis)
+        # Write directly after the leading zero instead of allocating a second
+        # full-size float64 array in concatenate. Keep the summation order and
+        # float64 division identical to the original implementation.
+        sum_shape = list(padded.shape)
+        sum_shape[axis] += 1
+        sums = np.empty(sum_shape, dtype=np.float64)
+        zero, target = [slice(None)] * result.ndim, [slice(None)] * result.ndim
+        zero[axis], target[axis] = 0, slice(1, None)
+        sums[tuple(zero)] = 0
+        np.cumsum(padded, axis=axis, dtype=np.float64, out=sums[tuple(target)])
         hi, lo = [slice(None)] * result.ndim, [slice(None)] * result.ndim
         hi[axis], lo[axis] = slice(width, None), slice(None, -width)
-        result = ((sums[tuple(hi)] - sums[tuple(lo)]) / width).astype(np.float32)
+        delta = sums[tuple(hi)] - sums[tuple(lo)]
+        delta /= width
+        result = delta.astype(np.float32)
     return result
+
+
+def _local_range_5(gray):
+    """Exact 5x5 uint8 range with Pillow's edge-replication boundary rule.
+
+    Min/max are separable, so four comparisons along each axis replace the
+    generic rank filters without a stacked 25-neighbour temporary array.
+    """
+    def extreme(op):
+        result = gray
+        for axis in (0, 1):
+            padding = [(0, 0), (0, 0)]
+            padding[axis] = (2, 2)
+            padded = np.pad(result, padding, mode="edge")
+            window = [slice(None), slice(None)]
+            window[axis] = slice(0, result.shape[axis])
+            output = padded[tuple(window)].copy()
+            for offset in range(1, 5):
+                window[axis] = slice(offset, offset + result.shape[axis])
+                op(output, padded[tuple(window)], out=output)
+            result = output
+        return result.astype(np.float32)
+
+    return (extreme(np.maximum) - extreme(np.minimum)) / 255
 
 
 def _shift(field, dy, dx):
@@ -56,9 +88,8 @@ def analyze(image_u8):
     protection = (1 - edge) * (1 - smoothstep(0.45, 0.9, coherence))
     # Crossings and letter corners are not directional. Protect their strong
     # local contrast as well, where a structure tensor alone is ambiguous.
-    gray = Image.fromarray((luma * 255).round().astype(np.uint8))
-    local_range = (np.asarray(gray.filter(ImageFilter.MaxFilter(5)), dtype=np.float32)
-                   - np.asarray(gray.filter(ImageFilter.MinFilter(5)), dtype=np.float32)) / 255
+    gray = (luma * 255).round().astype(np.uint8)
+    local_range = _local_range_5(gray)
     protection *= 1 - smoothstep(0.22, 0.40, local_range)
 
     # Repetition increases confidence, but is not mandatory: actual generated

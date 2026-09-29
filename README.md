@@ -189,12 +189,30 @@ not by how much was removed.
 
 ## Performance
 
-About **0.7 s per 1.5 MP image** on a recent GPU, using roughly 3 GB of VRAM. The VAE
-accounts for essentially all of that time; the correction network itself is free.
+Time depends on the device, resolution, enabled filters and cache state. The upstream
+basic-pipeline timing is not a timing for the extended Web UI: a new image normally
+needs one VAE encode, two decodes (baseline and correction), and CPU finishing.
+Colour/gradient cleanup and optional SR add work; cached reruns can skip earlier stages.
 
-The inference path is already tuned — the VAE is compiled and image encoding uses a
-fast preset — and both are enabled by default. For batches the CLI enables compilation
-automatically; for a long-running server pass `--compile on`.
+CPU cleanup uses allocation-reduced float64 box sums and separable exact 5×5 min/max
+filters. These preserve the original arithmetic, rounding and edge rules, without
+new dependencies or additional GPU work. Regression tests compare masks, finishing
+and pixels exactly against the previous primitives. Timing gains vary by image and
+settings; they do not come from reducing resolution or weakening cleanup.
+
+Local verification on Windows, Ryzen 5 5600G / RTX 4060 8 GB, PyTorch 2.13.0+cu126,
+bf16, VAE tiling and no compilation: after warm-up, two uncached runs per version
+averaged **8.80 → 7.46 s** at 1672×941 and **3.16 → 2.63 s** at 712×900.
+Settings: alpha 1, micro 0.55, spots 0.35, preserve 0.65; SR, colour/gradient filters,
+sharpening, grain and mask off. Times include processing and PNG encoding, not
+model startup or browser transport. PNG bytes matched; peak PyTorch CUDA allocated
+memory was unchanged (2692 / 1946 MiB respectively). These are two local examples,
+not a general throughput guarantee or total RAM/VRAM measurement.
+
+CLI compilation is automatic only above `--compile-min`; `--compile on` forces it.
+The Web UI compiles by default and accepts `--no-compile`. Compilation requires a
+compatible backend and adds warm-up time; it is not enabled in the local Windows
+benchmark environment. VAE tiling remains available to limit VRAM use.
 
 ## Limitations
 
